@@ -158,13 +158,20 @@ public class HorizonActivity extends NativeActivity {
     }
 
     private void capture(boolean on) {
-        View view = getWindow().getDecorView();
+        View decor = getWindow().getDecorView();
         if (on) {
-            view.setOnCapturedPointerListener(captureListener);
-            view.requestFocus();
-            view.requestPointerCapture();
+            // Captured events go to the focused view (the decor view hands them down to it), and
+            // in a NativeActivity that is the content view, not the decor view.
+            decor.requestFocus();
+            View focused = getCurrentFocus();
+            if (focused == null) {
+                focused = decor;
+            }
+            focused.setOnCapturedPointerListener(captureListener);
+            decor.setOnCapturedPointerListener(captureListener);
+            focused.requestPointerCapture();
         } else {
-            view.releasePointerCapture();
+            decor.releasePointerCapture();
             captured = false;
         }
     }

@@ -28,6 +28,11 @@ pub fn set_log_sink(sink: LogSink) {
     let _ = LOG_SINK.set(sink);
 }
 
+/// Whether a sink is set, so a caller can skip building the line.
+pub fn has_log_sink() -> bool {
+    LOG_SINK.get().is_some()
+}
+
 /// Sends a log line to the sink, if there is one. `priority` is Android's: 2 verbose,
 /// 3 debug, 4 info, 5 warn, 6 error.
 pub fn log_to_sink(priority: u8, message: &str) {

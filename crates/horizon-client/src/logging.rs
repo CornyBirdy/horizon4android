@@ -250,16 +250,18 @@ impl log::Log for Logger {
             Some(name) => name,
             None => "unnamed",
         };
-        crate::platform::log_to_sink(
-            match record.level() {
-                log::Level::Error => 6,
-                log::Level::Warn => 5,
-                log::Level::Info => 4,
-                log::Level::Debug => 3,
-                log::Level::Trace => 2,
-            },
-            &format!("[{thread}] {message}"),
-        );
+        if crate::platform::has_log_sink() {
+            crate::platform::log_to_sink(
+                match record.level() {
+                    log::Level::Error => 6,
+                    log::Level::Warn => 5,
+                    log::Level::Info => 4,
+                    log::Level::Debug => 3,
+                    log::Level::Trace => 2,
+                },
+                &format!("[{thread}] {message}"),
+            );
+        }
         self.write(thread, record.level(), &message);
     }
 
