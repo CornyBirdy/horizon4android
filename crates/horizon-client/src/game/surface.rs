@@ -16,6 +16,15 @@ impl Game<'_> {
         if let Some(renderer) = &mut self.renderer {
             renderer.suspend_surface();
         }
+        // Android may end an app in the background without a word: what is unsaved goes to disk now,
+        // asynchronously, as an autosave does.
+        if self.title.is_none()
+            && self.player.is_some()
+            && self.integrated.is_none()
+            && let Err(e) = self.save_game_with(false)
+        {
+            log::warn!("Horizon: could not save as the app went to the background: {e}");
+        }
         // Fingers and keys that were down will never be released.
         self.keys.clear();
         self.physical_keys.clear();

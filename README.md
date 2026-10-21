@@ -109,6 +109,12 @@ Everything prepared lands in the gitignored `.local/`. It is derived from the ga
 
 The client starts on the title screen. Command-line options (`--world`, `--seed`, `--creative`, `--render-distance`, `--dedicated`), controls, scripting through `horizon-ctl` and the architecture are described in [the native client guide](docs/native-client.md). The rest of the developer documentation is indexed in [docs/README.md](docs/README.md), including [the parity workflow](docs/parity-workflow.md).
 
+## Android
+
+An experimental Android port (ARM64, Vulkan, touch controls plus Bluetooth keyboard and mouse) lives in [`android/`](android/). It builds an
+installable debug APK with one script and reads the same prepared resources as the desktop game, copied to the phone. See [ANDROID.md](ANDROID.md)
+for building, setup and controls, and [TESTING.md](TESTING.md) for the on-device checklist. It has not been run on a device yet.
+
 ## Contributing
 
 Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) for how we work (vanilla first, small pull requests, labels), or [the contributing guide](https://playhorizon.dev/docs/contributing) on the site. Questions and ideas: [Discord](https://discord.gg/HcTeMZxe5E). Before opening a pull request, run the self-check and paste the block it prints:

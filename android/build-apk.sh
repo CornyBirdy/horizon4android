@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Builds Horizon's Android app: dist/horizon-android-debug.apk, signed with the debug key.
 #
-#   android/build-apk.sh [--release] [--no-audio] [--skip-native] [--install]
+#   android/build-apk.sh [--release] [--no-audio] [--mods] [--skip-native] [--install]
 #
 #   --release      full optimisation with thin LTO (slow to build; the default is the quicker
 #                  `fast` profile, which is optimised too)
 #   --no-audio     leave out sound (cpal), if it fails to build or run on the phone
+#   --mods         build the WebAssembly mod runtime (wasmtime) in; mods with code are off otherwise
 #   --skip-native  reuse the last native library build (only the Java side or resources changed)
 #   --install      adb install -r the result on the connected phone
 #
@@ -20,13 +21,15 @@ build="$here/build"
 dist="$root/dist"
 
 profile=fast
-features=()
+no_default=0
+mods=0
 skip_native=0
 install=0
 for arg in "$@"; do
   case "$arg" in
     --release) profile=release ;;
-    --no-audio) features=(--no-default-features) ;;
+    --no-audio) no_default=1 ;;
+    --mods) mods=1 ;;
     --skip-native) skip_native=1 ;;
     --install) install=1 ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -80,9 +83,11 @@ if [ "$skip_native" = 0 ]; then
     cp "$root/Cargo.lock" "$here/native/Cargo.lock"
   fi
   mkdir -p "$lib_dir"
-  profile_args=(--profile "$profile")
-  [ "$profile" = release ] && profile_args=(--release)
-  (cd "$here/native" && cargo ndk -t arm64-v8a -P 30 -o "$lib_dir" build "${profile_args[@]}" "${features[@]}")
+  cargo_args=(--profile "$profile")
+  [ "$profile" = release ] && cargo_args=(--release)
+  [ "$no_default" = 1 ] && cargo_args+=(--no-default-features)
+  [ "$mods" = 1 ] && cargo_args+=(--features mods)
+  (cd "$here/native" && cargo ndk -t arm64-v8a -P 30 -o "$lib_dir" build "${cargo_args[@]}")
 fi
 so="$lib_dir/arm64-v8a/libhorizon_android.so"
 [ -f "$so" ] || die "$so was not built"

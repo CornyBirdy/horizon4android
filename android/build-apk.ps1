@@ -3,11 +3,12 @@
   Builds Horizon's Android app: dist\horizon-android-debug.apk, signed with the debug key.
 
 .DESCRIPTION
-  android\build-apk.ps1 [-Release] [-NoAudio] [-SkipNative] [-Install]
+  android\build-apk.ps1 [-Release] [-NoAudio] [-Mods] [-SkipNative] [-Install]
 
     -Release     full optimisation with thin LTO (slow to build; the default is the quicker
                  'fast' profile, which is optimised too)
     -NoAudio     leave out sound (cpal), if it fails to build or run on the phone
+    -Mods        build the WebAssembly mod runtime (wasmtime) in; mods with code are off otherwise
     -SkipNative  reuse the last native library build (only the Java side or resources changed)
     -Install     adb install -r the result on the connected phone
 
@@ -19,6 +20,7 @@
 param(
   [switch]$Release,
   [switch]$NoAudio,
+  [switch]$Mods,
   [switch]$SkipNative,
   [switch]$Install
 )
@@ -129,6 +131,7 @@ if (-not $SkipNative) {
   $cargoArgs = @('ndk', '-t', 'arm64-v8a', '-P', '30', '-o', $libDir, 'build')
   if ($Release) { $cargoArgs += '--release' } else { $cargoArgs += @('--profile', 'fast') }
   if ($NoAudio) { $cargoArgs += '--no-default-features' }
+  if ($Mods) { $cargoArgs += @('--features', 'mods') }
   Push-Location "$here\native"
   try { Run 'cargo' $cargoArgs } finally { Pop-Location }
 }

@@ -108,8 +108,8 @@ fn start(app: &AndroidApp, files: &Path) -> Result<(), String> {
     let _ = fs::create_dir_all(&tmp);
     // The game takes its folder from the working directory and `HORIZON_HOME`, and a phone's
     // defaults for both (the root, and /data/local/tmp) are not writable.
-    // SAFETY: the game's threads do not exist yet; this thread is the only one reading the
-    // environment while it is set.
+    // SAFETY: the game's own threads do not exist yet, and nothing the glue's other threads run
+    // reads the environment.
     unsafe {
         std::env::set_var("HORIZON_HOME", files);
         std::env::set_var("HOME", &internal);
