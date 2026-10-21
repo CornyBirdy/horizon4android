@@ -696,6 +696,7 @@ mod tests {
             shown: false,
             menu: StartupMenu::default(),
             error: None,
+            suspended: false,
         }
     }
 

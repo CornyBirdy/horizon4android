@@ -275,6 +275,7 @@ struct Options {
 /// The command line. An Android app has none, so there the lines of `horizon-args.txt` in the
 /// game folder (`--world Test --creative`, `#` starts a comment) stand in for it.
 fn launch_args() -> Vec<String> {
+    #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(target_os = "android")]
     if let Ok(text) = std::fs::read_to_string("horizon-args.txt") {
