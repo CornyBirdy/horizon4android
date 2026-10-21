@@ -115,7 +115,7 @@ android/build-apk.sh --install
 The first build compiles the whole game for ARM64 and takes a while. The script:
 
 1. seeds `android/native/Cargo.lock` from the desktop `Cargo.lock` (so every dependency has the version the desktop
-   game is tested with) and runs `cargo ndk -t arm64-v8a -P 30 build` in `android/native`;
+   game is tested with) and runs `cargo ndk -t arm64-v8a --platform 30 build` in `android/native`;
 2. packages with the SDK's own tools: `aapt2` (manifest and icon), `javac` and `d8` (the two Java classes),
    `jar`/`zipalign` (the APK) and `apksigner`;
 3. signs it with the standard debug key (`~/.android/debug.keystore`, created if missing), so a rebuilt APK
@@ -123,6 +123,28 @@ The first build compiles the whole game for ARM64 and takes a while. The script:
 
 Mods with code (WebAssembly, `wasmtime`) are left out of the Android build by default (a smaller, quicker build, and one dependency
 less to go wrong); `--mods` builds them in. Content-only mods work either way.
+
+### Build the APK on GitHub (no local setup)
+
+`.github/workflows/android.yml` builds the APK in GitHub Actions on every push to the **`android-port`** branch and on demand. It needs no secrets,
+no repository variables and none of the upstream author's accounts, so it works on a fork. It installs the NDK (r27) and the Rust target, caches
+Cargo and the NDK, runs `android/build-apk.sh`, checks that the APK holds only the engine (`tools/check_android_apk.py`: no assets, game files, prepared
+resources or jars; the job fails otherwise, and also if the repository holds game artifacts), and uploads `horizon-android-debug-<short sha>.apk`
+as an artifact kept for 14 days. The APK is signed with a throwaway debug key made during the run, so a build from Actions will not install over one
+built on your computer (uninstall first, or always use one source).
+
+On your fork:
+
+1. Open the fork on GitHub, **Actions** tab, and press **I understand my workflows, go ahead and enable them** (forks have Actions off until you do).
+2. Put the code on a branch named `android-port` (`git push origin <your branch>:android-port`). Pushing it starts the workflow.
+3. To run it by hand: **Actions, android, Run workflow**, pick the branch. GitHub lists a manually run workflow only if the workflow file is on the
+   fork's **default branch**, so either make `android-port` the default branch (Settings, Branches) or merge the workflow file into `main` of the fork.
+4. When the run is green, open it and download the artifact (**horizon-android-debug-&lt;sha&gt;**, at the bottom of the run page). On the phone, open the
+   run in the browser (signed in to GitHub), download the artifact (it arrives as a `.zip`), unzip it with the Files app, and open the `.apk`; allow
+   *Install unknown apps* for that app when asked. Or on a computer: `gh run download <run id> -n horizon-android-debug-<sha>` and `adb install -r *.apk`.
+5. Copy the resources to the phone as described in [Resources](#resources); the APK never contains them.
+
+The first run builds everything from scratch (30 to 60 minutes); later runs reuse the caches.
 
 ## Device setup
 

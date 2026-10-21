@@ -1,0 +1,103 @@
+name: android
+# Builds the Android APK (ANDROID.md): on every push to the android-port branch and on demand.
+# Nothing here needs a secret, a repository variable or any account of the upstream author, so it
+# runs unchanged on a fork. The APK is signed with a throwaway debug key made during the run and
+# holds only the engine; the job fails if it or the repository holds anything of Minecraft's.
+# It is separate from, and never triggered by, the upstream workflows (ci.yml and the others).
+on:
+  push:
+    branches: [android-port]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  # Where GitHub's ubuntu runners keep the Android SDK (the cache steps need it as a literal).
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  NDK_VERSION: 27.2.12479018
+  SDK_PLATFORM: android-34
+  SDK_BUILD_TOOLS: 34.0.0
+  # Bump to reinstall cargo-ndk (the latest release is installed).
+  CARGO_NDK_CACHE: v1
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Keep game artifacts out of Git
+        run: |
+          python3 tools/check_public_tree.py
+          python3 tools/check_public_tree.py --history
+          python3 -m unittest tests.test_android_apk tests.test_lab.PublicationTests
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Rust toolchain and the Android target
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android
+          rustup default stable
+
+      - name: Android SDK packages and NDK (cached)
+        id: sdk
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+            ${{ env.ANDROID_HOME }}/build-tools/${{ env.SDK_BUILD_TOOLS }}
+            ${{ env.ANDROID_HOME }}/platforms/${{ env.SDK_PLATFORM }}
+          key: android-sdk-${{ runner.os }}-ndk${{ env.NDK_VERSION }}-bt${{ env.SDK_BUILD_TOOLS }}-${{ env.SDK_PLATFORM }}
+      - name: Install what the cache did not hold
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER="$(command -v sdkmanager)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;$NDK_VERSION" "build-tools;$SDK_BUILD_TOOLS" "platforms;$SDK_PLATFORM" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: cargo-ndk (cached)
+        id: cargo-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-${{ runner.os }}-${{ env.CARGO_NDK_CACHE }}
+      - if: steps.cargo-ndk.outputs.cache-hit != 'true'
+        run: cargo install cargo-ndk --locked
+
+      # Dependencies and the native crate's build, keyed on the lock file the build seeds from the desktop one.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/native
+          shared-key: android
+          key: ${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the APK
+        run: android/build-apk.sh
+
+      - name: The APK holds only the engine
+        run: python3 tools/check_android_apk.py dist/horizon-android-debug.apk
+
+      - name: Name the APK after the commit
+        id: name
+        run: |
+          short="${GITHUB_SHA::7}"
+          mv dist/horizon-android-debug.apk "dist/horizon-android-debug-$short.apk"
+          echo "file=dist/horizon-android-debug-$short.apk" >> "$GITHUB_OUTPUT"
+          echo "name=horizon-android-debug-$short" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ${{ steps.name.outputs.file }}
+          if-no-files-found: error
+          retention-days: 14

@@ -22,6 +22,10 @@
 
 # Horizon
 
+> **Android port: work in progress (WIP).** This fork adds an **experimental, unofficial** Android port. It is **not affiliated with or endorsed by the upstream author**, it **may not run on all devices**, and it has had **no testing on real hardware** beyond what is listed in [TESTING.md](TESTING.md) (so far, none of it has been run on a device). Details, build steps and known issues: [ANDROID.md](ANDROID.md).
+>
+> **Status** (updated as each phase lands): *Phase 1, build:* APK build script and a GitHub Actions workflow (`android-port` branch) are written, never yet built for Android. *Phase 2, run:* surface/lifecycle, Vulkan, folders and resource copying are written, untested. *Phase 3, input:* touch controls, Bluetooth keyboard and mouse are written, untested. *Phase 4, performance:* phone defaults and a thermal frame cap are written, untested. **Works today: nothing is confirmed.** Known gaps: no Android soft keyboard, no clipboard, no gamepads, no mods with code.
+
 Horizon is Minecraft: Java Edition 26.3 rewritten in Rust: a native game that reads the same worlds, follows the same rules and generates the same terrain as the Java game, and is checked against it by 281 differential harnesses. You play it through a small launcher, on the files from your own copy of Minecraft. It is free, open source and unofficial.
 
 > Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft. Horizon contains no Minecraft code, assets or data: you need your own legally obtained copy of Minecraft: Java Edition 26.3.

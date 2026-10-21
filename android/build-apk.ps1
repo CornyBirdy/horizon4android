@@ -128,7 +128,7 @@ if (-not $SkipNative) {
     Copy-Item "$root\Cargo.lock" "$here\native\Cargo.lock"
   }
   New-Item -ItemType Directory -Force $libDir | Out-Null
-  $cargoArgs = @('ndk', '-t', 'arm64-v8a', '-P', '30', '-o', $libDir, 'build')
+  $cargoArgs = @('ndk', '-t', 'arm64-v8a', '--platform', '30', '-o', $libDir, 'build')
   if ($Release) { $cargoArgs += '--release' } else { $cargoArgs += @('--profile', 'fast') }
   if ($NoAudio) { $cargoArgs += '--no-default-features' }
   if ($Mods) { $cargoArgs += @('--features', 'mods') }

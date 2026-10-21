@@ -87,7 +87,7 @@ if [ "$skip_native" = 0 ]; then
   [ "$profile" = release ] && cargo_args=(--release)
   [ "$no_default" = 1 ] && cargo_args+=(--no-default-features)
   [ "$mods" = 1 ] && cargo_args+=(--features mods)
-  (cd "$here/native" && cargo ndk -t arm64-v8a -P 30 -o "$lib_dir" build "${cargo_args[@]}")
+  (cd "$here/native" && cargo ndk -t arm64-v8a --platform 30 -o "$lib_dir" build "${cargo_args[@]}")
 fi
 so="$lib_dir/arm64-v8a/libhorizon_android.so"
 [ -f "$so" ] || die "$so was not built"
