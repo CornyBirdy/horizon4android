@@ -106,6 +106,8 @@ impl Game<'_> {
             && self.screen == Screen::Playing
             && self.sign_edit.is_none()
             && self.book.is_none()
+            // In bed the screen has a "Leave Bed" button to tap.
+            && self.sleeping.is_none()
         {
             Mode::Playing
         } else {

@@ -184,6 +184,7 @@ The game folder is `/sdcard/Android/data/dev.horizon.android/files/` (the app's 
 | `last-error.txt`, `running.marker` | what the launcher screen reads |
 | `horizon-args.txt` | optional command-line arguments, one or more per line (see below) |
 | `horizon-touch.txt` | optional touch layout tuning (see below) |
+| `horizon-env.txt` | optional environment variables for the game (see below) |
 
 On Android 11 and newer other apps and the Files app cannot open `Android/data`, but `adb push` and `adb pull` can.
 
@@ -241,6 +242,18 @@ A keyboard works as on the desktop (the default key bindings; text goes straight
 desktop: moving the pointer, clicking and the wheel in menus, and in the world the app captures the pointer for **mouse look**
 (Android's pointer capture), left click breaks, right click places. Pressing Escape frees the pointer for the pause menu.
 The touch controls stay usable beside them.
+
+### Debug switches without rebuilding
+
+`adb shell` cannot set environment variables for an app, so `horizon-env.txt` in the game folder does it: one `NAME=value` per line, `#` for comments,
+read at start. The desktop game's switches work, for example:
+
+```
+HORIZON_SPIKES=25        # log the timed spans of every frame slower than 25 ms
+HORIZON_NO_AUDIO=1       # no sound
+WGPU_BACKEND=vulkan
+HORIZON_SPRITE_SPLIT=64  # smaller block-texture arrays, if the GPU is short of layers
+```
 
 ### Tuning the touch layout
 

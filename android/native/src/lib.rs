@@ -27,6 +27,11 @@ const TAG: &std::ffi::CStr = c"Horizon";
 /// it ended at all.
 const ERROR_FILE: &str = "last-error.txt";
 const RUNNING_FILE: &str = "running.marker";
+/// Environment variables to set before the game starts, one `NAME=value` per line (`#` starts
+/// a comment): the debugging switches of the desktop game (`HORIZON_SPIKES=20`, `WGPU_BACKEND=vulkan`,
+/// `HORIZON_NO_AUDIO=1`, `HORIZON_SPRITE_SPLIT=...`) without rebuilding the app. `adb shell` cannot set
+/// them for an app, so they come from a file in the game folder.
+const ENV_FILE: &str = "horizon-env.txt";
 
 #[link(name = "log")]
 unsafe extern "C" {
@@ -119,6 +124,7 @@ fn start(app: &AndroidApp, files: &Path) -> Result<(), String> {
     }
     std::env::set_current_dir(files)
         .map_err(|e| format!("Could not enter {}: {e}", files.display()))?;
+    let from_file = env_file(files);
     fs::write(files.join(RUNNING_FILE), "running\n").ok();
     let _ = fs::remove_file(files.join(ERROR_FILE));
     logging::init(files, "Render thread");
@@ -130,6 +136,9 @@ fn start(app: &AndroidApp, files: &Path) -> Result<(), String> {
         files.display(),
         internal.display()
     );
+    if !from_file.is_empty() {
+        log::info!("Horizon: environment from {ENV_FILE}: {from_file:?}");
+    }
     match mobile::seed(files) {
         Ok(written) if !written.is_empty() => {
             log::info!("Horizon: first start, wrote the phone defaults to {written:?}");
@@ -149,6 +158,27 @@ fn start(app: &AndroidApp, files: &Path) -> Result<(), String> {
         return Err(message);
     }
     Ok(())
+}
+
+/// Sets the variables in `horizon-env.txt`, returning their names.
+fn env_file(files: &Path) -> Vec<String> {
+    let text = fs::read_to_string(files.join(ENV_FILE)).unwrap_or_default();
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once('=') {
+            let name = name.trim();
+            if !name.is_empty() && !name.contains('\0') && !value.contains('\0') {
+                // SAFETY: as in `start`: the game's threads are not running yet.
+                unsafe { std::env::set_var(name, value.trim()) };
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
 }
 
 /// Stops with a readable message when the prepared resources are not on the phone, which is
