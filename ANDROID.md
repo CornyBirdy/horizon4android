@@ -4,14 +4,11 @@ Horizon runs natively on Android (ARM64, Vulkan), aimed at the Samsung Galaxy Z 
 game loop as the desktop client, with touch controls, Bluetooth keyboard and mouse support, and
 lighter defaults for a phone.
 
-> **Read this first: it has not been compiled for Android or run on a device.**
-> This port was written in a sandbox that could not reach the Rust Android target, the NDK, crates.io or
-> a phone. The Rust, Java and scripts were checked by reading, by `rustfmt`, and by compiling and testing
-> the pieces that depend on nothing but `std` (the touch controls, the platform event queue, the mods stub,
-> the Java sources' syntax). Expect to meet a few compile errors on the first `build-apk` and some runtime
-> surprises on the phone. [TESTING.md](TESTING.md) is a checklist ordered from "the app launches" to
-> "walk around a world", so you can report exactly which step fails. The desktop builds do not change
-> (see [What changed in shared code](#what-changed-in-shared-code)).
+> **Read this first: it has not been run on a device.**
+> The Rust, Java and scripts build: GitHub Actions compiles the game for `aarch64-linux-android`, packages and signs the APK, and checks it holds
+> only the engine (see [Build the APK on GitHub](#build-the-apk-on-github-no-local-setup)). Nothing past that has been seen working: no Vulkan
+> device, no touch input, no lifecycle. Expect runtime surprises on the phone. [TESTING.md](TESTING.md) is a checklist ordered from "the app launches" to
+> "walk around a world", so you can report exactly which step fails. The desktop builds do not change (see [What changed in shared code](#what-changed-in-shared-code)).
 
 Horizon contains no Minecraft files. They are prepared on a computer from your own Minecraft Java
 Edition with `horizon-prepare`, and copied to the phone; see [Resources](#resources).
@@ -144,7 +141,7 @@ On your fork:
    *Install unknown apps* for that app when asked. Or on a computer: `gh run download <run id> -n horizon-android-debug-<sha>` and `adb install -r *.apk`.
 5. Copy the resources to the phone as described in [Resources](#resources); the APK never contains them.
 
-The first run builds everything from scratch (30 to 60 minutes); later runs reuse the caches.
+The first run builds everything from scratch (about 10 minutes on GitHub runners); later runs reuse the caches.
 
 ## Device setup
 

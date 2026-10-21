@@ -22,6 +22,29 @@ env:
   # Bump to reinstall cargo-ndk (the latest release is installed).
   CARGO_NDK_CACHE: v1
 jobs:
+  # The desktop client must not change: the same checks upstream's ci.yml runs, on the crates this port touches.
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and the ALSA and udev headers the client links against
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-desktop
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (client, mods)
+        run: |
+          cargo clippy -p horizon-client -p horizon-mods --all-targets -- -D warnings
+          cargo clippy -p horizon-client --all-targets --no-default-features -- -D warnings
+      - name: Tests (client, mods)
+        run: cargo test -p horizon-client -p horizon-mods
+
   apk:
     runs-on: ubuntu-latest
     timeout-minutes: 90
