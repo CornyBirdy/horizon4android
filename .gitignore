@@ -31,3 +31,8 @@
 /.horizon-cache/
 /crash-reports/
 /debug/
+
+# Android app build output (android/build-apk.sh): the APK, intermediates, the native crate's target and lock.
+/android/build/
+/android/native/target/
+/android/native/Cargo.lock

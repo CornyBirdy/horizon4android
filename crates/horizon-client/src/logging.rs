@@ -224,8 +224,14 @@ fn ours(target: &str) -> bool {
 
 impl log::Log for Logger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
-        meta.level() <= log::Level::Info
-            && (ours(meta.target()) || meta.level() <= log::Level::Error)
+        // On Android the other crates' warnings (wgpu, the Vulkan driver) are the only
+        // trace of a graphics problem on a phone with no terminal, so they are kept.
+        let other_level = if cfg!(target_os = "android") {
+            log::Level::Warn
+        } else {
+            log::Level::Error
+        };
+        meta.level() <= log::Level::Info && (ours(meta.target()) || meta.level() <= other_level)
     }
 
     fn log(&self, record: &log::Record) {
@@ -242,6 +248,16 @@ impl log::Log for Logger {
             Some(name) => name,
             None => "unnamed",
         };
+        crate::platform::log_to_sink(
+            match record.level() {
+                log::Level::Error => 6,
+                log::Level::Warn => 5,
+                log::Level::Info => 4,
+                log::Level::Debug => 3,
+                log::Level::Trace => 2,
+            },
+            &format!("[{thread}] {message}"),
+        );
         self.write(thread, record.level(), &message);
     }
 

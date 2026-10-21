@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Horizon for Android. Two activities:
+
+  - LauncherActivity (main process): the front door. Says whether the game's resources are on the
+    phone, starts the game, and shows why the last run ended badly.
+  - HorizonActivity (":game" process): Android's NativeActivity, subclassed to take a real mouse
+    and the thermal state. It loads libhorizon_android.so, whose android_main runs the game.
+    The game runs in a process of its own because it keeps process-wide state and runs once per
+    process: the activity kills its process when it is destroyed, and the launcher stays up.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.horizon.android"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <uses-sdk
+        android:minSdkVersion="30"
+        android:targetSdkVersion="34" />
+
+    <!-- Vulkan 1.1; wgpu needs it. -->
+    <uses-feature
+        android:name="android.hardware.vulkan.version"
+        android:version="0x401000"
+        android:required="true" />
+    <!-- A Bluetooth keyboard and mouse work without a touch screen's help. -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <!-- Multiplayer, and joining online-mode servers. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="Horizon"
+        android:icon="@drawable/ic_launcher"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:largeHeap="true"
+        android:resizeableActivity="true">
+
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          configChanges: a fold, an unfold or a rotation resizes the window; it must not
+          recreate the activity (and restart the game). The game gets the new size as an event.
+        -->
+        <activity
+            android:name=".HorizonActivity"
+            android:process=":game"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:windowSoftInputMode="adjustNothing"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale|mcc|mnc|touchscreen|colorMode">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="horizon_android" />
+        </activity>
+    </application>
+</manifest>

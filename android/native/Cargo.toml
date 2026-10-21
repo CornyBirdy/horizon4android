@@ -1,0 +1,51 @@
+[package]
+name = "horizon-android"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+description = "Horizon on Android: the native library the app's activity loads (ANDROID.md)"
+publish = false
+
+# Its own workspace, like the launcher: the desktop workspace never builds it, and its
+# lock file is seeded from the desktop one so every dependency keeps the version the
+# desktop client is tested with (android/build-apk.sh does that).
+[workspace]
+
+[lib]
+name = "horizon_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# No controllers on Android: gilrs has no backend for it and a phone's pad comes through
+# the touch controls and Bluetooth keyboards and mice, not evdev.
+horizon-client = { path = "../../crates/horizon-client", default-features = false }
+# The glue crate comes through winit (`winit::platform::android::activity`), whose
+# NativeActivity backend horizon-client turns on; one version of it must be linked.
+winit = { version = "0.30.13", default-features = false, features = ["android-native-activity", "rwh_06"] }
+log = "0.4"
+
+[features]
+default = ["audio"]
+# Sound through cpal's AAudio backend. Off (`--no-default-features`) if it fails to build or run.
+audio = ["horizon-client/audio"]
+
+# wgpu-hal 30.0.1 with gfx-rs/wgpu#10124, as in the desktop workspace (see its Cargo.toml).
+[patch.crates-io]
+wgpu-hal = { path = "../../third_party/wgpu-hal" }
+
+# As the desktop workspace's profiles: line tables keep file:line in backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# A phone has no use for the debug sections: the APK would carry them.
+strip = "debuginfo"
+
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
