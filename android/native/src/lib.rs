@@ -78,7 +78,9 @@ fn android_main(app: AndroidApp) {
                 .map(|s| (*s).to_owned())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_owned());
-            Some(format!("The game crashed: {what}\n\nA crash report is in the crash-reports folder of the game folder, and the log in logs/latest.log."))
+            Some(format!(
+                "The game crashed: {what}\n\nA crash report is in the crash-reports folder of the game folder, and the log in logs/latest.log."
+            ))
         }
     };
     logging::flush();
@@ -99,7 +101,9 @@ fn files_dir(app: &AndroidApp) -> PathBuf {
 
 fn start(app: &AndroidApp, files: &Path) -> Result<(), String> {
     fs::create_dir_all(files).map_err(|e| format!("Could not create {}: {e}", files.display()))?;
-    let internal = app.internal_data_path().unwrap_or_else(|| files.to_path_buf());
+    let internal = app
+        .internal_data_path()
+        .unwrap_or_else(|| files.to_path_buf());
     let tmp = internal.join("tmp");
     let _ = fs::create_dir_all(&tmp);
     // The game takes its folder from the working directory and `HORIZON_HOME`, and a phone's
