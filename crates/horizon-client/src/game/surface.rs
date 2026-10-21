@@ -25,6 +25,8 @@ impl Game<'_> {
         {
             log::warn!("Horizon: could not save as the app went to the background: {e}");
         }
+        // A game in the background makes no noise (the music would play on).
+        self.audio.stop_all();
         // Fingers and keys that were down will never be released.
         self.keys.clear();
         self.physical_keys.clear();
