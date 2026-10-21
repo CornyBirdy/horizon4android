@@ -29,7 +29,7 @@ for arg in "$@"; do
     --no-audio) features=(--no-default-features) ;;
     --skip-native) skip_native=1 ;;
     --install) install=1 ;;
-    -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown option $arg (--help lists them)" >&2; exit 2 ;;
   esac
 done

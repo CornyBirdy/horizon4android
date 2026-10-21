@@ -14,3 +14,8 @@ pub use content::Content;
 pub use manifest::{Capability, Manifest, Package, Side};
 #[cfg(feature = "runtime")]
 pub use runtime::*;
+// Without the runtime (Android) the same names, with nothing running behind them.
+#[cfg(not(feature = "runtime"))]
+mod stub;
+#[cfg(not(feature = "runtime"))]
+pub use stub::*;
