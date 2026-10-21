@@ -28,10 +28,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust and the ALSA and udev headers the client links against
+      - name: Install Rust (with the wasm target the mod tests build for) and the ALSA and udev headers
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
           rustup default stable
       - uses: Swatinem/rust-cache@v2
         with:
