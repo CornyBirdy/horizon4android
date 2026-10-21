@@ -26,10 +26,6 @@ use winit::{
     keyboard::KeyCode,
 };
 
-/// Mouse counts per dp of a look drag: with the default sensitivity, a drag across a
-/// 400 dp wide screen turns the view about 100 degrees. The Mouse Sensitivity option scales it.
-const LOOK_GAIN: f64 = 1.6;
-
 /// The touch controls' state in the game.
 pub(super) struct TouchState {
     controls: TouchControls,
@@ -46,7 +42,10 @@ impl Default for TouchState {
     fn default() -> Self {
         Self {
             controls: TouchControls::new(
-                Layout::default(),
+                // `horizon-touch.txt` in the game folder (the working directory) tunes it.
+                std::env::current_dir()
+                    .map(|dir| Layout::load(&dir))
+                    .unwrap_or_default(),
                 controls::Screen::plain(1280.0, 720.0, 1.0),
             ),
             enabled: cfg!(target_os = "android")
@@ -55,6 +54,26 @@ impl Default for TouchState {
             pointer: (0.0, 0.0),
             swallowing: false,
         }
+    }
+}
+
+/// A finger as the mouse: the events a pointer at its place and a left button would send. The
+/// startup menu, shown while the resources load, takes only a mouse.
+pub(super) fn touch_as_mouse(touch: winit::event::Touch) -> Vec<WindowEvent> {
+    let device_id = touch.device_id;
+    let at = WindowEvent::CursorMoved {
+        device_id,
+        position: touch.location,
+    };
+    let button = |state| WindowEvent::MouseInput {
+        device_id,
+        state,
+        button: MouseButton::Left,
+    };
+    match touch.phase {
+        TouchPhase::Started => vec![at, button(ElementState::Pressed)],
+        TouchPhase::Moved => vec![at],
+        TouchPhase::Ended | TouchPhase::Cancelled => vec![at, button(ElementState::Released)],
     }
 }
 
@@ -68,6 +87,7 @@ impl Game<'_> {
             Button::Place => "key.use",
             Button::Inventory => "key.inventory",
             Button::Chat => "key.chat",
+            Button::Drop => "key.drop",
             _ => return None,
         })
     }
@@ -245,8 +265,10 @@ impl Game<'_> {
             Action::Move(_) => {}
             Action::Look { dx, dy } => {
                 if self.captured && self.focused && self.screen == Screen::Playing {
+                    // The Mouse Sensitivity option scales it further, as for a mouse.
+                    let gain = f64::from(self.touch.controls.layout().look_gain);
                     self.mouse
-                        .add_motion(f64::from(dx) * LOOK_GAIN, f64::from(dy) * LOOK_GAIN);
+                        .add_motion(f64::from(dx) * gain, f64::from(dy) * gain);
                 }
             }
             Action::Sprint(on) => {

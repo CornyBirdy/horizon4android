@@ -12130,9 +12130,20 @@ impl Loading {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
             return;
         }
-        if let Err(error) = self.menu_event(event_loop, event) {
-            self.error = Some(error);
-            event_loop.exit();
+        // On a touch screen a finger is the mouse here (the game's own touch controls start
+        // with the game).
+        let events = match event {
+            WindowEvent::Touch(touch) if cfg!(target_os = "android") => {
+                touch::touch_as_mouse(touch)
+            }
+            event => vec![event],
+        };
+        for event in events {
+            if let Err(error) = self.menu_event(event_loop, event) {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
         }
     }
     /// The menu bundle arrived: rebuild the loading screen with the real atlas

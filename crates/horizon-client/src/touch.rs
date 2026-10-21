@@ -31,6 +31,8 @@ pub enum Button {
     Inventory,
     Chat,
     Pause,
+    /// Throws the item in hand.
+    Drop,
     // In menus.
     /// What Escape does.
     Back,
@@ -55,6 +57,7 @@ impl Button {
             Button::Inventory => "Inv",
             Button::Chat => "Chat",
             Button::Pause => "Menu",
+            Button::Drop => "Drop",
             Button::Back => "Back",
             Button::Shift => "Shift",
             Button::RightClick => "Right",
@@ -170,6 +173,9 @@ pub struct Layout {
     pub hotbar_reach: f32,
     /// Seconds between scroll steps while a scroll button is held.
     pub scroll_repeat: f32,
+    /// Mouse counts per dp of a look drag: with 1.6 and the default Mouse Sensitivity, a drag
+    /// across a 400 dp wide screen turns the view about 100 degrees.
+    pub look_gain: f32,
 }
 
 impl Default for Layout {
@@ -187,7 +193,52 @@ impl Default for Layout {
             slop: 8.0,
             hotbar_reach: 14.0,
             scroll_repeat: 0.12,
+            look_gain: 1.6,
         }
+    }
+}
+
+impl Layout {
+    /// The file in the game folder that overrides the layout, a line per setting as
+    /// `key:value`. Unknown lines and unreadable values are skipped; every value is kept
+    /// within a sensible range, so a typo cannot make the controls unusable.
+    pub const FILE: &'static str = "horizon-touch.txt";
+
+    pub fn load(dir: &std::path::Path) -> Self {
+        std::fs::read_to_string(dir.join(Self::FILE))
+            .map(|text| Self::parse(&text))
+            .unwrap_or_default()
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut layout = Self::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(v) = value.trim().parse::<f32>() else {
+                continue;
+            };
+            if !v.is_finite() {
+                continue;
+            }
+            match key.trim() {
+                "buttonSize" => layout.button_fraction = v.clamp(0.05, 0.4),
+                "buttonMin" => layout.button_min = v.clamp(24.0, 120.0),
+                "buttonMax" => layout.button_max = v.clamp(24.0, 160.0),
+                "margin" => layout.margin = v.clamp(0.0, 80.0),
+                "gap" => layout.gap = v.clamp(0.0, 40.0),
+                "stickRadius" => layout.stick_radius = v.clamp(30.0, 160.0),
+                "stickZone" => layout.stick_zone = v.clamp(0.2, 0.7),
+                "deadzone" => layout.deadzone = v.clamp(0.0, 0.5),
+                "sprintPush" => layout.sprint_push = v.clamp(0.6, 1.5),
+                "lookGain" => layout.look_gain = v.clamp(0.2, 8.0),
+                _ => {}
+            }
+        }
+        // The size limits stay in order whatever the file says.
+        layout.button_max = layout.button_max.max(layout.button_min);
+        layout
     }
 }
 
@@ -287,6 +338,7 @@ fn arrange(layout: &Layout, screen: Screen, mode: Mode) -> Arrangement {
             buttons.push((Button::Pause, top(m)));
             buttons.push((Button::Chat, top(m + small + g)));
             buttons.push((Button::Inventory, top(screen.width - m - small)));
+            buttons.push((Button::Drop, top(screen.width - m - 2.0 * small - g)));
         }
         Mode::Menu => {
             let order = [
@@ -1284,6 +1336,27 @@ mod tests {
             c.touch(1, Phase::Ended, 0.0, 0.0, 0.1),
             vec![Action::Release(Button::Back)]
         );
+    }
+
+    #[test]
+    fn the_layout_file_overrides_what_it_names_and_clamps_the_rest() {
+        let layout = Layout::parse(
+            "buttonSize:0.2\nlookGain: 3\nmargin:9999\nbogus:1\nstickZone:abc\nnot a line\nbuttonMin:100\nbuttonMax:50\n",
+        );
+        assert_eq!(layout.button_fraction, 0.2);
+        assert_eq!(layout.look_gain, 3.0);
+        assert_eq!(layout.margin, 80.0, "clamped");
+        assert_eq!(
+            layout.stick_zone,
+            Layout::default().stick_zone,
+            "unreadable: kept"
+        );
+        assert!(layout.button_max >= layout.button_min);
+        assert_eq!(Layout::parse(""), Layout::default());
+        // A bigger button size makes bigger buttons.
+        let big = TouchControls::new(layout.clone(), cover());
+        let normal = TouchControls::new(Layout::default(), cover());
+        assert!(rect_of(&big, Button::Jump).w >= rect_of(&normal, Button::Jump).w);
     }
 
     #[test]

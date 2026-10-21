@@ -187,6 +187,8 @@ pub fn open_latest(dir: &Path) -> io::Result<Option<Latest>> {
     match lock.try_lock() {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => return Ok(None),
+        // Android's shared storage can be a file system that has no locks: log without one.
+        Err(fs::TryLockError::Error(_)) if cfg!(target_os = "android") => {}
         Err(fs::TryLockError::Error(e)) => return Err(e),
     }
     let mut file = OpenOptions::new()
