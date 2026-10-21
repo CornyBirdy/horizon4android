@@ -391,7 +391,12 @@ impl Game<'_> {
         );
     }
 
-    fn touch_mouse_button(&mut self, event_loop: &ActiveEventLoop, button: MouseButton, down: bool) {
+    fn touch_mouse_button(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        button: MouseButton,
+        down: bool,
+    ) {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
