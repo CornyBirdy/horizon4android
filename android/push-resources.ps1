@@ -31,7 +31,18 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $package = 'dev.horizon.android'
-if (-not $Resources) { $Resources = Join-Path $root '.local\horizon-client\26.3' }
+if (-not $Resources) {
+  $Resources = Join-Path $root '.local\horizon-client\26.3'
+  # Not prepared in this checkout: use what the Horizon launcher prepared.
+  if (-not (Test-Path (Join-Path $Resources 'horizon-resources.json'))) {
+    $launcher = Join-Path $env:APPDATA 'horizon-launcher\versions'
+    if (Test-Path $launcher) {
+      $hit = Get-ChildItem -Path $launcher -Recurse -Depth 5 -Filter 'horizon-resources.json' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+      if ($hit) { $Resources = $hit.DirectoryName; Write-Host "Using the launcher's prepared folder: $Resources" }
+    }
+  }
+}
 
 function Die([string]$message) { throw "error: $message" }
 function Run([string]$exe, [string[]]$arguments) {

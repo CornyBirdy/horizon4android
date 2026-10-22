@@ -54,10 +54,12 @@ launcher with "The last run ended with an error: The game's resources are missin
 
 ### Resources
 
-**5. The resources copy.** `android\push-resources.ps1 -Prepare -ServerJar <jar>` (or `--resources <prepared folder>` if you have them)
-finishes with "Done". The launcher screen now says "Resources found in ...".
-- Fails in `horizon-prepare`: the same step on the desktop would fail too (send its message). Fails in `adb push`: send the message;
-  check `adb shell ls /sdcard/Android/data/dev.horizon.android/files/resources | head`.
+**5. The resources import.** Prepare on the PC with the Horizon launcher (Prepare button), run `android\make-phone-resources.bat` (writes `horizon-resources.zip` to
+the Desktop), send the zip to the phone, tap **Import resources from a zip** and pick it. The launcher screen then says "Resources found in ...".
+(The adb route still works: `android\push-resources.ps1`, which finds the launcher's prepared folder itself.)
+- "no horizon-resources.json in what was copied": the zip is of the wrong folder; pack the folder that holds `horizon-resources.json`.
+- The import fails with another message: send it. Check free space too (the resources are large and are copied, then the zip stays in Download).
+- Prepare fails on the PC: the same step on the desktop would fail too (send the red message under the buttons); usually JDK 25 or Minecraft 26.3 not launched once.
 
 ### The game starts
 
