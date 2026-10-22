@@ -187,6 +187,8 @@ pub fn open_latest(dir: &Path) -> io::Result<Option<Latest>> {
     match lock.try_lock() {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => return Ok(None),
+        // Android's shared storage can be a file system that has no locks: log without one.
+        Err(fs::TryLockError::Error(_)) if cfg!(target_os = "android") => {}
         Err(fs::TryLockError::Error(e)) => return Err(e),
     }
     let mut file = OpenOptions::new()
@@ -224,8 +226,14 @@ fn ours(target: &str) -> bool {
 
 impl log::Log for Logger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
-        meta.level() <= log::Level::Info
-            && (ours(meta.target()) || meta.level() <= log::Level::Error)
+        // On Android the other crates' warnings (wgpu, the Vulkan driver) are the only
+        // trace of a graphics problem on a phone with no terminal, so they are kept.
+        let other_level = if cfg!(target_os = "android") {
+            log::Level::Warn
+        } else {
+            log::Level::Error
+        };
+        meta.level() <= log::Level::Info && (ours(meta.target()) || meta.level() <= other_level)
     }
 
     fn log(&self, record: &log::Record) {
@@ -242,6 +250,18 @@ impl log::Log for Logger {
             Some(name) => name,
             None => "unnamed",
         };
+        if crate::platform::has_log_sink() {
+            crate::platform::log_to_sink(
+                match record.level() {
+                    log::Level::Error => 6,
+                    log::Level::Warn => 5,
+                    log::Level::Info => 4,
+                    log::Level::Debug => 3,
+                    log::Level::Trace => 2,
+                },
+                &format!("[{thread}] {message}"),
+            );
+        }
         self.write(thread, record.level(), &message);
     }
 

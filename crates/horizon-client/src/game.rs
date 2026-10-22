@@ -138,9 +138,11 @@ mod storage;
 mod structures;
 mod subtitle_hud;
 mod sulfur_cubes;
+mod surface;
 mod titles;
 mod tnt;
 mod totem;
+mod touch;
 mod trading;
 mod trial_spawner;
 mod trial_visuals;
@@ -219,7 +221,7 @@ use std::{
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
 };
@@ -270,6 +272,21 @@ struct Options {
     /// Set on the integrated server's own options: it draws nothing, so it skips meshing.
     integrated: bool,
 }
+/// The command line. An Android app has none, so there the lines of `horizon-args.txt` in the
+/// game folder (`--world Test --creative`, `#` starts a comment) stand in for it.
+fn launch_args() -> Vec<String> {
+    #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "android")]
+    if let Ok(text) = std::fs::read_to_string("horizon-args.txt") {
+        args.extend(
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .flat_map(|line| line.split_whitespace().map(str::to_owned)),
+        );
+    }
+    args
+}
 impl Options {
     /// The name to join servers with: the one given, else the offline name kept
     /// next to options.txt (created on first use).
@@ -289,6 +306,9 @@ impl Options {
         let mut o = Self {
             resources: if sibling.join("horizon-resources.json").exists() {
                 sibling
+            } else if cfg!(target_os = "android") {
+                // The app's files folder is the working directory (docs: ANDROID.md).
+                PathBuf::from("resources")
             } else {
                 PathBuf::from(".local/horizon-client/26.3")
             },
@@ -324,7 +344,7 @@ impl Options {
             integrated: false,
         };
         let mut session_file = std::env::var("HORIZON_SESSION_FILE").ok();
-        let mut args = std::env::args().skip(1);
+        let mut args = launch_args().into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--help" | "-h" => {
@@ -1097,6 +1117,8 @@ struct Game<'a> {
     last_input: Instant,
     /// Controllers (Horizon's own).
     pad: pad::Pads,
+    /// The touch screen's controls (Android; off on the desktop).
+    touch: touch::TouchState,
     frames: u64,
     /// Frames drawn with the player in the world, for `--world-frames`.
     world_frames: u64,
@@ -4217,6 +4239,11 @@ impl Game<'_> {
                 .set_cursor_grab(CursorGrabMode::Locked)
                 .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
                 .is_ok();
+            // Android has no cursor to grab in winit: the view is the game's while playing, for a
+            // finger's drag as much as for a mouse that the app captures through the Java side.
+            if cfg!(target_os = "android") {
+                self.captured = true;
+            }
             if self.captured && self.focused {
                 warp(window);
             }
@@ -4379,6 +4406,7 @@ impl Game<'_> {
         self.draw_debug_overlay(&mut batch, size);
         self.frame_graph
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
+        self.draw_touch(&mut batch);
         self.draw_pad_cursor(&mut batch);
         batch
     }
@@ -9996,6 +10024,8 @@ impl Game<'_> {
 impl ApplicationHandler for Game<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
+            // Android gives the window a new surface when the app comes back to the front.
+            self.surface_back(event_loop);
             return;
         }
         // The Window constructor: created fullscreen when options.txt says so.
@@ -10035,6 +10065,9 @@ impl ApplicationHandler for Game<'_> {
         self.window = Some(window);
         self.apply_settings();
         self.previous = Instant::now();
+    }
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.surface_lost();
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
@@ -10182,6 +10215,7 @@ impl ApplicationHandler for Game<'_> {
                         }
                     }
                 }
+                WindowEvent::Touch(touch) => self.touch_event(event_loop, touch),
                 WindowEvent::MouseWheel { delta, .. } => {
                     let (raw_x, raw_y) = match delta {
                         MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
@@ -10784,6 +10818,7 @@ impl ApplicationHandler for Game<'_> {
             return;
         }
         self.poll_control(event_loop);
+        self.touch_frame(event_loop);
         self.poll_pads(event_loop);
         if self.options.frames.is_some() && self.started.elapsed() > self.options.timeout {
             self.error = Some("frame-limited run timed out".into());
@@ -10800,7 +10835,14 @@ impl ApplicationHandler for Game<'_> {
                 w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::Poll);
+        // Without a surface (Android, in the background) there is nothing to draw: sleep until
+        // the window is back instead of spinning.
+        let drawing = self.renderer.as_ref().is_none_or(|r| r.has_surface());
+        event_loop.set_control_flow(if drawing {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::Wait
+        });
     }
     /// The application is ending. On macOS, Quit (Cmd+Q) ends it through
     /// applicationWillTerminate without a CloseRequested; vanilla's GLFW
@@ -10946,6 +10988,7 @@ impl<'a> Game<'a> {
             previous: now,
             last_input: now,
             pad: Default::default(),
+            touch: Default::default(),
             frames: 0,
             world_frames: 0,
             fps: 0.0,
@@ -11976,7 +12019,7 @@ fn write_report(game: &Game<'_>) -> Result<()> {
 }
 
 fn run_event_loop(mut game: Game<'_>) -> Result<()> {
-    EventLoop::new()?.run_app(&mut game)?;
+    horizon_client::winit_host::event_loop()?.run_app(&mut game)?;
     write_report(&game)?;
     if let Some(e) = game.error.take() {
         return Err(e);
@@ -12003,10 +12046,30 @@ struct Loading {
     shown: bool,
     menu: startup_menu::StartupMenu,
     error: Option<Box<dyn std::error::Error>>,
+    /// The window's surface is gone (Android: the app is in the background); nothing may be
+    /// attached to it until `resumed`.
+    suspended: bool,
 }
 impl Loading {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
+            self.suspended = false;
+            if let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer)
+                && !renderer.has_surface()
+            {
+                let size = window.inner_size();
+                match renderer.reattach_surface(size.width, size.height) {
+                    Ok(()) => log::info!(
+                        "Horizon: the window's surface is back ({}x{})",
+                        size.width,
+                        size.height
+                    ),
+                    Err(e) => {
+                        self.error = Some(e);
+                        event_loop.exit();
+                    }
+                }
+            }
             return;
         }
         // The Window constructor: created fullscreen when options.txt says so.
@@ -12054,13 +12117,34 @@ impl Loading {
         horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
         self.window = Some(window);
     }
+    /// The window's surface is going away (Android): let go of it now, attach it again in `resumed`.
+    fn suspended(&mut self) {
+        if !cfg!(target_os = "android") {
+            return;
+        }
+        self.suspended = true;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.suspend_surface();
+        }
+    }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
             return;
         }
-        if let Err(error) = self.menu_event(event_loop, event) {
-            self.error = Some(error);
-            event_loop.exit();
+        // On a touch screen a finger is the mouse here (the game's own touch controls start
+        // with the game).
+        let events = match event {
+            WindowEvent::Touch(touch) if cfg!(target_os = "android") => {
+                touch::touch_as_mouse(touch)
+            }
+            event => vec![event],
+        };
+        for event in events {
+            if let Err(error) = self.menu_event(event_loop, event) {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
         }
     }
     /// The menu bundle arrived: rebuild the loading screen with the real atlas
@@ -12098,6 +12182,15 @@ impl Loading {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if horizon_client::platform::exit_requested() {
+            event_loop.exit();
+            return;
+        }
+        if self.suspended {
+            // Nothing to draw to: sleep until the window comes back.
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         if let Err(error) = self.poll_menu_resources() {
             self.error = Some(error);
             event_loop.exit();
@@ -12231,6 +12324,12 @@ impl ApplicationHandler for App {
             App::Ready(game) => game.resumed(event_loop),
         }
     }
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            App::Loading(loading) => loading.suspended(),
+            App::Ready(game) => game.suspended(event_loop),
+        }
+    }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match self {
             App::Loading(loading) => loading.window_event(event_loop, id, event),
@@ -12258,6 +12357,10 @@ impl ApplicationHandler for App {
                 loading.about_to_wait(event_loop);
                 if loading.error.is_some() {
                     event_loop.exit();
+                    return;
+                }
+                // The handoff builds a renderer on the window's surface, which is gone.
+                if loading.suspended {
                     return;
                 }
                 match if loading.menu.reload_packs {
@@ -12326,9 +12429,10 @@ fn run_loading(
         shown: false,
         menu,
         error: None,
+        suspended: false,
     };
     let mut app = App::Loading(Box::new(loading));
-    EventLoop::new()?.run_app(&mut app)?;
+    horizon_client::winit_host::event_loop()?.run_app(&mut app)?;
     match app {
         App::Ready(mut game) => {
             write_report(&game)?;

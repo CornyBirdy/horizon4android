@@ -326,9 +326,16 @@ impl Game<'_> {
             has_overlay: false,
         };
         let limit = framerate_limit(self.settings.max_fps as i32, context);
-        self.settings
+        let limit = self
+            .settings
             .horizon
-            .battery_limit(limit, self.title.is_none(), self.focused)
+            .battery_limit(limit, self.title.is_none(), self.focused);
+        // A phone that has warmed up draws fewer frames (never a cap off Android).
+        let thermal = horizon_client::platform::thermal_status();
+        match horizon_client::platform::thermal_fps_cap(thermal) {
+            Some(cap) => limit.min(cap as i32),
+            None => limit,
+        }
     }
     /// `Minecraft.runTick`'s frame limiter: `FramerateLimiter.limitDisplayFPS`
     /// below 260 frames per second, sleeping then spin-waiting until the

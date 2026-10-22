@@ -1,6 +1,11 @@
 //! Horizon native client: resources, world streaming, rendering and the
 //! bindings between the validated simulation pieces and the game loop.
 #![forbid(unsafe_code)]
+// The game loop (`game.rs`, which `main.rs` declares as the binary's own module) is part
+// of the library on Android, where the `horizon-android` cdylib has to reach it. These
+// two lines are Android-only, so the desktop's crate layout is unchanged.
+#[cfg(target_os = "android")]
+extern crate self as horizon_client;
 pub mod advancements;
 pub mod ambience;
 pub mod animate_tick;
@@ -69,6 +74,8 @@ pub mod flatgen;
 pub mod fog;
 pub mod font;
 pub mod front;
+#[cfg(target_os = "android")]
+mod game;
 pub mod game_mode_switcher;
 pub mod gamepad;
 pub mod gamerules;
@@ -110,6 +117,7 @@ pub mod merchant;
 pub mod mesher;
 pub mod minimap;
 pub mod mipmap;
+pub mod mobile;
 pub mod mobs;
 pub mod mod_content;
 pub mod mod_list;
@@ -135,6 +143,7 @@ pub mod particles;
 pub mod patrol;
 pub mod perf_overlay;
 pub mod pick_item;
+pub mod platform;
 pub mod player_sync;
 pub mod poi_sections;
 pub mod portal_sections;
@@ -179,6 +188,7 @@ pub mod ticket_levels;
 pub mod title;
 pub mod title_edition;
 pub mod toasts;
+pub mod touch;
 pub mod ui;
 pub mod ui_theme;
 pub mod vanillagen;
@@ -186,8 +196,16 @@ pub mod vault;
 pub mod weather;
 pub mod widgets;
 pub mod window;
+pub mod winit_host;
 pub mod world;
 pub mod world_spawn;
 pub mod worldborder;
 pub mod zip;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Runs the game until it ends: the Android library's entry point (`horizon-android`), where the
+/// game loop is part of this library instead of the `horizon-client` binary's own module.
+#[cfg(target_os = "android")]
+pub fn run_game() -> Result<()> {
+    game::run()
+}

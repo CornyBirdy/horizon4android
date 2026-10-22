@@ -397,6 +397,15 @@ pub fn panic_report(info: &std::panic::PanicHookInfo, side: &'static str) -> Rep
     }
 }
 
+/// The thread that counts as the main one besides the one named `main`: on Android the
+/// glue runs the game on a thread of its own.
+static MAIN_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+/// Makes the calling thread the main thread for [`install`]'s hook.
+pub fn mark_main_thread() {
+    let _ = MAIN_THREAD.set(std::thread::current().id());
+}
+
 /// Reports panics: on the main thread a crash report (the panic then ends the game, exit code
 /// 101); on other threads the error goes to the log, as vanilla's uncaught exception handler
 /// does. The default hook still prints the panic.
@@ -404,7 +413,8 @@ pub fn install(home: PathBuf, side: &'static str) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
-        let main = std::thread::current().name() == Some("main");
+        let main = std::thread::current().name() == Some("main")
+            || MAIN_THREAD.get() == Some(&std::thread::current().id());
         if main {
             deliver(&home, panic_report(info, side));
         } else {
