@@ -17,8 +17,8 @@ Edition with `horizon-prepare`, and copied to the phone; see [Resources](#resour
 
 You need a Windows PC once, to prepare the game files from your own Minecraft. The phone cannot do that step.
 
-1. **Install the app.** On the phone's browser open the repository's *Actions* tab, the newest green run of "android", scroll to *Artifacts*, tap
-   `horizon-android-debug-<id>`. Unzip, tap the `.apk`, allow "install unknown apps" when asked.
+1. **Install the app.** On the phone open the repository's *Releases* page, the "Horizon for Android (latest build)" pre-release, and tap `horizon-android-debug.apk` (or, from the *Actions* tab, the newest green run, *Artifacts*,
+   `horizon-android-debug-<id>`, which is a zip to unzip). Tap the `.apk` and allow "install unknown apps" when asked.
 2. **Prepare on the PC.** Launch Minecraft 26.3 once from your launcher (Modrinth App works: create a vanilla 26.3 instance and start it to the title screen).
    Install the Horizon launcher from https://playhorizon.dev, select the version and press **Prepare**. It needs a JDK 25 (Eclipse Temurin) and may ask for the
    26.3 server jar from minecraft.net. Wait for "Prepared for Minecraft 26.3"; a red message under the buttons says what is missing.

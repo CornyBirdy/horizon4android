@@ -48,6 +48,9 @@ jobs:
   apk:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      # Only to keep the "android-latest" pre-release below current; nothing else writes.
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,3 +127,18 @@ jobs:
           path: ${{ steps.name.outputs.file }}
           if-no-files-found: error
           retention-days: 14
+
+      # A fixed download link for the phone: Releases > android-latest > horizon-android-debug.apk.
+      # Uses the workflow's own token, so a fork needs no secrets. The APK is the engine only (the
+      # content check above has passed by now).
+      - name: Keep the android-latest pre-release current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK: ${{ steps.name.outputs.file }}
+        run: |
+          cp "$APK" dist/horizon-android-debug.apk
+          gh release delete android-latest --cleanup-tag --yes || true
+          gh release create android-latest dist/horizon-android-debug.apk \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Horizon for Android (latest build)" \
+            --notes "Unofficial, experimental debug build from commit ${GITHUB_SHA::7}. The engine only: no Minecraft files. See ANDROID.md."
