@@ -22,8 +22,7 @@ You need a Windows PC once, to prepare the game files from your own Minecraft. T
 2. **Prepare on the PC.** Launch Minecraft 26.3 once from your launcher (Modrinth App works: create a vanilla 26.3 instance and start it to the title screen).
    Install the Horizon launcher from https://playhorizon.dev, select the version and press **Prepare**. It needs a JDK 25 (Eclipse Temurin) and may ask for the
    26.3 server jar from minecraft.net. Wait for "Prepared for Minecraft 26.3"; a red message under the buttons says what is missing.
-3. **Pack it.** Double-click `android\make-phone-resources.bat` (download this repository as a zip from GitHub to get it, or run
-   `tar -a -c -f %USERPROFILE%\Desktop\horizon-resources.zip -C "<prepared folder>" .` yourself). It finds the launcher's prepared files and writes
+3. **Pack it.** Double-click `android\make-phone-resources.bat` (download this repository as a zip from GitHub to get it). It finds the launcher's prepared files and writes
    `horizon-resources.zip` to the Desktop.
 4. **Send it to the phone**: USB cable into the Download folder, Google Drive, a messaging app, whatever you like.
 5. **Import.** Open Horizon on the phone, tap **Import resources from a zip**, pick `horizon-resources.zip`. (Or **Import resources from a folder** if you copied the
