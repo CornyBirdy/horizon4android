@@ -2065,12 +2065,19 @@ impl Renderer {
         // HORIZON_GPU_CULL=0 turns occlusion culling off, `all` culls every
         // frame however little it hides (A/B checks).
         let cull_env = std::env::var("HORIZON_GPU_CULL");
-        let cull = (cull_env.as_deref() != Ok("0") && cull::Cull::supported(&adapter, &device))
-            .then(|| {
-                let mut cull = cull::Cull::new(&device, config.format.remove_srgb_suffix());
-                cull.always = cull_env.as_deref() == Ok("all");
-                cull
-            });
+        // Android: the Adreno 740's compiler rejects the culling pipeline (its shader forces an
+        // early depth test and writes storage from the fragment stage), which loses the device.
+        // Off there unless `HORIZON_GPU_CULL=1` (or `all`) is set in horizon-env.txt.
+        let cull_wanted = match cull_env.as_deref() {
+            Ok("0") => false,
+            Ok("1" | "all") => true,
+            _ => !cfg!(target_os = "android"),
+        };
+        let cull = (cull_wanted && cull::Cull::supported(&adapter, &device)).then(|| {
+            let mut cull = cull::Cull::new(&device, config.format.remove_srgb_suffix());
+            cull.always = cull_env.as_deref() == Ok("all");
+            cull
+        });
         let world_post = world_post::Post::new(&device, config.format.remove_srgb_suffix());
         let uploads = upload::Uploads::new(&device);
         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
