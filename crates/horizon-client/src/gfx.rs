@@ -820,8 +820,11 @@ async fn open_device(
                     #[cfg(target_os = "android")]
                     {
                         device.set_device_lost_callback(|reason, message| {
+                            // The callback runs where the failing call was made, so the trace
+                            // names the pipeline or resource the driver refused.
                             log::error!(
-                                "Horizon renderer: the graphics device was lost ({reason:?}): {message}"
+                                "Horizon renderer: the graphics device was lost ({reason:?}): {message}\n{}",
+                                std::backtrace::Backtrace::force_capture()
                             );
                         });
                         let reported = std::sync::atomic::AtomicU32::new(0);
