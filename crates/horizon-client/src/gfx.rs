@@ -2160,6 +2160,17 @@ impl Renderer {
         })
     }
     fn quad_indices(device: &wgpu::Device, quads: u32) -> wgpu::Buffer {
+        // 24 bytes of indices per quad. A request past what the device can allocate (a phone
+        // driver offers much less than a desktop GPU) used to fail as an invalid buffer and
+        // panic; it is logged and capped instead.
+        let limit = (device.limits().max_buffer_size / 24).min(u64::from(u32::MAX / 4)) as u32;
+        if quads > 1 << 16 || quads > limit {
+            log::info!(
+                "Horizon renderer: index buffer for {quads} quads ({} MB); the device allows {limit} quads",
+                (u64::from(quads) * 24) >> 20
+            );
+        }
+        let quads = quads.min(limit);
         let indices: Vec<u32> = (0..quads)
             .flat_map(|q| {
                 let b = q * 4;
