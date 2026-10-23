@@ -292,9 +292,12 @@ public class LauncherActivity extends Activity {
             root = staging;
         }
         if (root == null || !new File(root, MANIFEST).isFile()) {
+            String found = describe(staging);
             deleteTree(staging);
-            throw new IOException("no " + MANIFEST + " in what was copied. Is this the "
-                    + "prepared folder?");
+            throw new IOException("no " + MANIFEST + " in what was copied ("
+                    + megabytes(bytes[0]) + ").\nWhat came out: " + found + "\n"
+                    + "Pack the folder that holds " + MANIFEST + " (android\\make-phone-resources"
+                    + ".bat does) and pick that zip.");
         }
         progress("Putting the files in place");
         File target = new File(folder, "resources");
@@ -303,6 +306,23 @@ public class LauncherActivity extends Activity {
             throw new IOException("could not move the files into " + target);
         }
         deleteTree(staging);
+    }
+
+    /** The first few names in a folder, for an error message. */
+    private static String describe(File dir) {
+        String[] names = dir.list();
+        if (names == null || names.length == 0) {
+            return "nothing (the file is not a readable zip, or it is empty)";
+        }
+        java.util.Arrays.sort(names);
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < names.length && i < 8; i++) {
+            out.append(i > 0 ? ", " : "").append(names[i]);
+        }
+        if (names.length > 8) {
+            out.append(", ... (").append(names.length).append(" items)");
+        }
+        return out.toString();
     }
 
     private void unzip(InputStream in, File into, long[] bytes) throws IOException {
