@@ -30,6 +30,11 @@ You need a Windows PC once, to prepare the game files from your own Minecraft. T
 
 `adb` is optional and still works: [Resources](#resources).
 
+**Updating the app keeps your resources.** Builds are signed with the project's fixed debug key (`android/horizon-debug.keystore`, public on purpose: it is a
+debug key and protects nothing), so a new APK installs over the old one and the imported resources, worlds and settings stay. Builds before this one used a
+key made fresh on each CI run, which is why Android refused to update them: uninstall such a build once (this deletes its imported resources; import them
+again), and every later update installs in place. Uninstalling always deletes the app's folder under `Android/data`.
+
 ## Contents
 
 - [Quick start](#quick-start-no-cables-no-command-line)

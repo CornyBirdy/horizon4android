@@ -127,9 +127,11 @@ cp "$build/base.apk" "$build/unsigned.apk"
 (cd "$build/stage" && jar --update --no-manifest --file "$build/unsigned.apk" classes.dex lib)
 "$zipalign" -p -f 4 "$build/unsigned.apk" "$build/aligned.apk"
 
-# The debug key Android Studio makes; made here when there is none, so that a rebuilt app
-# installs over the last one.
-keystore="${HORIZON_ANDROID_KEYSTORE:-$HOME/.android/debug.keystore}"
+# The project's debug key (android/horizon-debug.keystore, password "android"). It is public on
+# purpose: this is a debug build, and one fixed key is what lets a new build install over the
+# last one without uninstalling (a key made fresh on each machine or CI run makes Android
+# refuse the update). HORIZON_ANDROID_KEYSTORE overrides it; one is made when the file is missing.
+keystore="${HORIZON_ANDROID_KEYSTORE:-$here/horizon-debug.keystore}"
 if [ ! -f "$keystore" ]; then
   mkdir -p "$(dirname "$keystore")"
   keytool -genkeypair -keystore "$keystore" -storepass android -keypass android \

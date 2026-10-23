@@ -12163,7 +12163,7 @@ impl Loading {
         };
         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
         if let Some(renderer) = &mut self.renderer {
-            renderer.release_surface();
+            renderer.hand_off_surface();
         }
         match loading_renderer(
             window,
@@ -12248,7 +12248,7 @@ impl Loading {
         let window = self.window.clone().ok_or("window closed")?;
         // Keep the loader's device and swap in the real textures in one step.
         if let Some(renderer) = &mut self.renderer {
-            renderer.release_surface();
+            renderer.hand_off_surface();
         }
         let renderer_at = Instant::now();
         let renderer = build_renderer(

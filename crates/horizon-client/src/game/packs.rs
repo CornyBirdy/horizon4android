@@ -150,7 +150,7 @@ impl Game<'_> {
         )?;
         // Keep the working GPU resources, but release its exclusive window surface.
         if let Some(renderer) = &mut self.renderer {
-            renderer.release_surface();
+            renderer.hand_off_surface();
         }
         let renderer = match self
             .window

@@ -265,6 +265,10 @@ pub struct Renderer {
     adapter: wgpu::Adapter,
     /// The window's swapchain; `None` when rendering offscreen (`--offscreen`).
     surface: Option<wgpu::Surface<'static>>,
+    /// Android: the surface a renderer lets go of for the renderer that replaces it on the
+    /// same device. The window takes one Vulkan surface at a time; a second one fails the
+    /// driver's swapchain and loses the whole device.
+    parked_surface: std::sync::Mutex<Option<wgpu::Surface<'static>>>,
     /// The offscreen colour target, sized like `config`.
     offscreen: Option<wgpu::Texture>,
     /// Offscreen submissions still on the GPU: at most two frames run ahead.
@@ -811,6 +815,25 @@ async fn open_device(
                 .await
             {
                 Ok((device, queue)) => {
+                    // Android: say why the device is lost or an operation fails, which the
+                    // default handler turns into a panic that hides the cause.
+                    #[cfg(target_os = "android")]
+                    {
+                        device.set_device_lost_callback(|reason, message| {
+                            log::error!(
+                                "Horizon renderer: the graphics device was lost ({reason:?}): {message}"
+                            );
+                        });
+                        let reported = std::sync::atomic::AtomicU32::new(0);
+                        device.on_uncaptured_error(std::sync::Arc::new(
+                            move |error: wgpu::Error| {
+                                if reported.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50
+                                {
+                                    log::error!("Horizon renderer: wgpu error: {error}");
+                                }
+                            },
+                        ));
+                    }
                     return Ok(Opened {
                         instance,
                         surface,
@@ -915,7 +938,15 @@ impl Renderer {
                     surface: if offscreen {
                         None
                     } else {
-                        Some(renderer.instance.create_surface(window.clone())?)
+                        let parked = renderer
+                            .parked_surface
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take();
+                        match parked {
+                            Some(surface) => Some(surface),
+                            None => Some(renderer.instance.create_surface(window.clone())?),
+                        }
                     },
                     instance: renderer.instance.clone(),
                     adapter: renderer.adapter.clone(),
@@ -2039,6 +2070,7 @@ impl Renderer {
             instance,
             adapter,
             surface,
+            parked_surface: Default::default(),
             offscreen,
             in_flight: std::collections::VecDeque::new(),
             first_frame: if previous.is_none() {
@@ -2233,6 +2265,25 @@ impl Renderer {
     /// Release the window surface before another renderer uses the same window.
     pub fn release_surface(&mut self) {
         self.surface = None;
+        *self
+            .parked_surface
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    /// Let go of the window surface for the renderer that takes over this one's device
+    /// (`Renderer::new` with `previous`). Android keeps the surface itself for that renderer:
+    /// a second Vulkan surface on the same window loses the device. Elsewhere the surface is
+    /// dropped, as [`Renderer::release_surface`] does.
+    pub fn hand_off_surface(&mut self) {
+        if cfg!(target_os = "android") && self.offscreen.is_none() {
+            let surface = self.surface.take();
+            *self
+                .parked_surface
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner()) = surface;
+        } else {
+            self.release_surface();
+        }
     }
     /// Whether frames can be drawn: a window surface is attached, or this is an offscreen renderer.
     pub fn has_surface(&self) -> bool {

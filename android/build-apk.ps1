@@ -170,10 +170,12 @@ Push-Location "$build\stage"
 try { Run $jar @('--update', '--no-manifest', '--file', "$build\unsigned.apk", 'classes.dex', 'lib') } finally { Pop-Location }
 Run $zipalign @('-p', '-f', '4', "$build\unsigned.apk", "$build\aligned.apk")
 
-# The debug key Android Studio makes; made here when there is none, so that a rebuilt app
-# installs over the last one.
+# The project's debug key (android\horizon-debug.keystore, password "android"). It is public on
+# purpose: this is a debug build, and one fixed key is what lets a new build install over the
+# last one without uninstalling (a key made fresh on each machine or CI run makes Android
+# refuse the update). HORIZON_ANDROID_KEYSTORE overrides it; one is made when the file is missing.
 $keystore = $env:HORIZON_ANDROID_KEYSTORE
-if (-not $keystore) { $keystore = "$env:USERPROFILE\.android\debug.keystore" }
+if (-not $keystore) { $keystore = Join-Path $here 'horizon-debug.keystore' }
 if (-not (Test-Path $keystore)) {
   New-Item -ItemType Directory -Force (Split-Path -Parent $keystore) | Out-Null
   Run $keytool @('-genkeypair', '-keystore', $keystore, '-storepass', 'android', '-keypass', 'android',
