@@ -763,11 +763,18 @@ async fn open_device(
         }
         // Mappable primary buffers: section pages that no longer fit in
         // video memory go to system memory.
+        // Android: mappable primary buffers make wgpu create every buffer that starts mapped
+        // (`create_buffer_init`) in host-visible memory, which the Adreno 740 driver refuses for
+        // an index buffer ("Quad indices is invalid" at startup). Only the overflow of terrain
+        // into system memory uses the feature, and the renderer checks for it.
+        let mappable = if cfg!(target_os = "android") {
+            wgpu::Features::empty()
+        } else {
+            wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+        };
         let features = timing::GpuTimer::features(&adapter)
             | cull::Cull::features(&adapter)
-            | (adapter.features()
-                & (wgpu::Features::INDIRECT_FIRST_INSTANCE
-                    | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS));
+            | (adapter.features() & (wgpu::Features::INDIRECT_FIRST_INSTANCE | mappable));
         let driver = format!("{} {}", info.driver, info.driver_info);
         startup_step(format_args!(
             "requesting the device (driver {}) with features [{features}] and the adapter's \
