@@ -1358,7 +1358,7 @@ impl Renderer {
             &lightmap_sampler,
         );
         let index_quads = 1 << 16;
-        let indices = Self::quad_indices(&device, index_quads);
+        let indices = Self::quad_indices(&device, &queue, index_quads);
         let instance_capacity = 4096;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Section origins"),
@@ -2166,10 +2166,9 @@ impl Renderer {
             present_modes,
         })
     }
-    fn quad_indices(device: &wgpu::Device, quads: u32) -> wgpu::Buffer {
+    fn quad_indices(device: &wgpu::Device, queue: &wgpu::Queue, quads: u32) -> wgpu::Buffer {
         // 24 bytes of indices per quad. A request past what the device can allocate (a phone
-        // driver offers much less than a desktop GPU) used to fail as an invalid buffer and
-        // panic; it is logged and capped instead.
+        // driver offers much less than a desktop GPU) is logged and capped.
         let limit = (device.limits().max_buffer_size / 24).min(u64::from(u32::MAX / 4)) as u32;
         if quads > 1 << 16 || quads > limit {
             log::info!(
@@ -2184,11 +2183,29 @@ impl Renderer {
                 [b, b + 1, b + 2, b, b + 2, b + 3]
             })
             .collect();
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let bytes: &[u8] = bytemuck::cast_slice(&indices);
+        // Created unmapped and filled through the queue: a buffer that starts mapped
+        // (`create_buffer_init`) came out invalid on the Adreno 740, with the reason never
+        // reported. The scopes catch whatever the driver says and log it.
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Quad indices"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        })
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytes);
+        // Native error scopes resolve at once.
+        let out_of_memory = pollster::block_on(memory.pop());
+        let invalid = pollster::block_on(validation.pop());
+        if let Some(error) = out_of_memory.or(invalid) {
+            log::error!(
+                "Horizon renderer: the index buffer ({} bytes) failed: {error}",
+                bytes.len()
+            );
+        }
+        buffer
     }
     fn offscreen_target(
         device: &wgpu::Device,
@@ -2399,7 +2416,7 @@ impl Renderer {
         let max = solid.max(translucent);
         if max > self.index_quads {
             self.index_quads = max.next_power_of_two();
-            self.indices = Self::quad_indices(&self.device, self.index_quads);
+            self.indices = Self::quad_indices(&self.device, &self.queue, self.index_quads);
         }
         let vertices = (mesh.solid.len() + mesh.translucent.len()) as u64;
         let encoder = self.section_copies.get_or_insert_with(|| {
@@ -3307,7 +3324,7 @@ impl Renderer {
             (world_quads + additive_quads + hand_quads + see_through_quads).max(cloud_quads);
         if max_quads > self.index_quads {
             self.index_quads = max_quads.next_power_of_two();
-            self.indices = Self::quad_indices(&self.device, self.index_quads);
+            self.indices = Self::quad_indices(&self.device, &self.queue, self.index_quads);
         }
         if let Some(b) = &frame.border {
             if b.rebuilt {
