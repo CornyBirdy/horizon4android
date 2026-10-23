@@ -7,19 +7,27 @@ struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) direction: vec3<f32>,
 }
+// The cube's 12 triangles as corner numbers, 3 bits each, ten to a word: the Adreno compiler
+// loses the device on a constant array indexed by the vertex number, so the tables are plain
+// numbers and shifts. Corners 1, 2, 5, 6 have x = 1; 2, 3, 6, 7 have y = 1; 4 to 7 have z = 1.
+const CUBE0 = 0x2ad6e9bcu;
+const CUBE1 = 0x180cb44au;
+const CUBE2 = 0x32e9f9c7u;
+const CUBE3 = 0xd160u;
+
+fn cube_corner(index: u32) -> u32 {
+    let word = index / 10u;
+    let packed = select(select(select(CUBE3, CUBE2, word < 3u), CUBE1, word < 2u), CUBE0, word < 1u);
+    return (packed >> ((index % 10u) * 3u)) & 7u;
+}
+
 @vertex fn vs_panorama(@builtin(vertex_index) index: u32) -> Out {
-    let corners = array<vec3<f32>, 8>(
-        vec3(-1.0, -1.0, -1.0), vec3(1.0, -1.0, -1.0),
-        vec3(1.0, 1.0, -1.0), vec3(-1.0, 1.0, -1.0),
-        vec3(-1.0, -1.0, 1.0), vec3(1.0, -1.0, 1.0),
-        vec3(1.0, 1.0, 1.0), vec3(-1.0, 1.0, 1.0),
+    let corner = cube_corner(index);
+    let position = vec3(
+        select(-1.0, 1.0, ((0x66u >> corner) & 1u) != 0u),
+        select(-1.0, 1.0, ((0xCCu >> corner) & 1u) != 0u),
+        select(-1.0, 1.0, ((0xF0u >> corner) & 1u) != 0u),
     );
-    let indices = array<u32, 36>(
-        4, 7, 6, 4, 6, 5, 5, 6, 2, 5, 2, 1,
-        1, 2, 3, 1, 3, 0, 0, 3, 7, 0, 7, 4,
-        7, 3, 2, 7, 2, 6, 0, 4, 5, 0, 5, 1,
-    );
-    let position = corners[indices[index]];
     var out: Out;
     out.clip = projection.view_proj * vec4(position, 1.0);
     out.direction = position;
