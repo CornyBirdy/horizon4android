@@ -190,8 +190,8 @@ public class LauncherActivity extends Activity {
                 Intent send = new Intent(Intent.ACTION_SEND);
                 send.setType("text/plain");
                 send.putExtra(Intent.EXTRA_SUBJECT, "Horizon log");
-                send.putExtra(Intent.EXTRA_TEXT, tail(
-                        new File(new File(folder, "logs"), "latest.log"), 60000));
+                send.putExtra(Intent.EXTRA_TEXT, shareable(
+                        new File(new File(folder, "logs"), "latest.log")));
                 startActivity(Intent.createChooser(send, "Share the log"));
             }
         }));
@@ -469,6 +469,42 @@ public class LauncherActivity extends Activity {
             }
         }
         file.delete();
+    }
+
+    /**
+     * The log for sharing: its start (how the run began) and its end, with runs of the same
+     * line collapsed, so that a warning repeated every frame cannot push the cause out.
+     */
+    private static String shareable(File log) {
+        String all = tail(log, 400000);
+        String[] lines = all.split("\n");
+        StringBuilder out = new StringBuilder();
+        String last = null;
+        int repeats = 0;
+        for (String line : lines) {
+            // The part after the time stamp decides whether two lines are the same.
+            int cut = line.indexOf("] ");
+            String key = cut >= 0 ? line.substring(cut) : line;
+            if (key.equals(last)) {
+                repeats++;
+                continue;
+            }
+            if (repeats > 0) {
+                out.append("  (the line above repeated ").append(repeats).append(" more times)\n");
+            }
+            repeats = 0;
+            last = key;
+            out.append(line).append('\n');
+        }
+        if (repeats > 0) {
+            out.append("  (the line above repeated ").append(repeats).append(" more times)\n");
+        }
+        String text = out.toString();
+        if (text.length() > 60000) {
+            text = text.substring(0, 20000) + "\n[... middle of the log left out ...]\n"
+                    + text.substring(text.length() - 40000);
+        }
+        return text;
     }
 
     private static String read(File file, int max) {

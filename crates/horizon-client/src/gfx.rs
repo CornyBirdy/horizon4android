@@ -822,10 +822,12 @@ async fn open_device(
                         device.set_device_lost_callback(|reason, message| {
                             // The callback runs where the failing call was made, so the trace
                             // names the pipeline or resource the driver refused.
-                            log::error!(
-                                "Horizon renderer: the graphics device was lost ({reason:?}): {message}\n{}",
+                            let report = format!(
+                                "the graphics device was lost ({reason:?}): {message}\n{}",
                                 std::backtrace::Backtrace::force_capture()
                             );
+                            log::error!("Horizon renderer: {report}");
+                            *DEVICE_LOST.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
                         });
                         let reported = std::sync::atomic::AtomicU32::new(0);
                         device.on_uncaptured_error(std::sync::Arc::new(
@@ -867,6 +869,23 @@ const NO_GPU_DRIVER: &str = "No Vulkan graphics driver found: Horizon needs the 
 /// driver: it leaves no panic or crash report, so the log's last line is the
 /// only sign of where the game stopped. The log file is written unbuffered;
 /// the flush is for loggers that buffer.
+/// Android: why the graphics device died, kept for the error screen (the device being lost
+/// would otherwise show up as a panic about an unrelated buffer).
+#[cfg(target_os = "android")]
+static DEVICE_LOST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+fn device_lost() -> Option<String> {
+    #[cfg(target_os = "android")]
+    {
+        DEVICE_LOST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+}
 fn startup_step(step: std::fmt::Arguments) {
     log::info!("Horizon renderer: {step}");
     log::logger().flush();
@@ -2068,6 +2087,9 @@ impl Renderer {
                 on_off(cull.is_some()),
                 on_off(gpu_timer.is_some()),
             ));
+        }
+        if let Some(lost) = device_lost() {
+            return Err(format!("The renderer could not be set up: {lost}").into());
         }
         Ok(Self {
             instance,

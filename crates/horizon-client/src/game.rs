@@ -12226,7 +12226,15 @@ impl Loading {
                     self.menu.perf.title_shown()
                 }
                 Ok(_) => {}
-                Err(e) => log::warn!("Horizon: loading screen frame failed: {e}"),
+                Err(e) => {
+                    // Every frame fails the same way once the surface is gone: log the first few.
+                    static FAILED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = FAILED.fetch_add(1, Ordering::Relaxed);
+                    if n < 5 || n % 1000 == 0 {
+                        log::warn!("Horizon: loading screen frame failed ({n} so far): {e}");
+                    }
+                }
             }
         }
         if !self.shown {
