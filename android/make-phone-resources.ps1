@@ -40,16 +40,41 @@ if (-not (Test-Path (Join-Path $Resources 'horizon-resources.json'))) {
 }
 if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath('Desktop')) 'horizon-resources.zip' }
 
-$tar = Get-Command tar.exe -ErrorAction SilentlyContinue
-if (-not $tar) { Die 'tar.exe was not found (it ships with Windows 10 and 11).' }
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-Write-Host "Packing $Resources"
-Write-Host "  -> $Out   (this can take a few minutes)"
-if (Test-Path $Out) { Remove-Item $Out -Force }
+$base = (Resolve-Path $Resources).Path.TrimEnd('\', '/')
 # horizon-data.bin is the game's cache of these files, written for this computer's folder path: the
 # phone writes its own on the first start, so it is left out (it would only make the zip bigger).
-& tar.exe -a -c -f $Out --exclude horizon-data.bin -C $Resources .
-if ($LASTEXITCODE -ne 0) { Die "tar failed with exit code $LASTEXITCODE" }
+$files = @(Get-ChildItem -LiteralPath $base -Recurse -File -Force |
+  Where-Object { $_.FullName -ne (Join-Path $base 'horizon-data.bin') })
+if ($files.Count -eq 0) { Die "$Resources holds no files." }
+Write-Host "Packing $base"
+Write-Host "  $($files.Count) files -> $Out   (this can take a few minutes)"
+if (Test-Path $Out) { Remove-Item $Out -Force }
+
+# Entry names are written by hand with forward slashes: tar.exe and Compress-Archive make zips
+# that Explorer shows empty or that the phone unpacks wrongly.
+$zip = [System.IO.Compression.ZipFile]::Open($Out, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+  $done = 0
+  foreach ($file in $files) {
+    $name = $file.FullName.Substring($base.Length).TrimStart('\', '/').Replace('\', '/')
+    [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+      $zip, $file.FullName, $name, [System.IO.Compression.CompressionLevel]::Fastest)
+    $done++
+    if ($done % 500 -eq 0) { Write-Host "  $done / $($files.Count)" }
+  }
+} finally { $zip.Dispose() }
+
+# A zip that Windows itself cannot read back is not worth sending.
+$check = [System.IO.Compression.ZipFile]::OpenRead($Out)
+try {
+  $entries = $check.Entries.Count
+  $manifest = $check.Entries | Where-Object { $_.FullName -eq 'horizon-resources.json' }
+} finally { $check.Dispose() }
+if (-not $manifest) { Die 'The zip was written without horizon-resources.json at its top level.' }
+Write-Host "  $entries files in the zip, horizon-resources.json at the top level."
 
 $size = [math]::Round((Get-Item $Out).Length / 1MB)
 Write-Host ''

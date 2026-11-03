@@ -85,7 +85,11 @@ pub fn outline_vertices(edges: &[[f64; 6]], camera: glam::DVec3) -> Vec<[f32; 6]
 /// the sections it removes. Keep the pass available for explicit A/B checks,
 /// while leaving hardware adapters on the existing default.
 fn gpu_culling_requested(info: &wgpu::AdapterInfo, env: Option<&str>) -> bool {
-    env != Some("0") && (env.is_some() || info.device_type != wgpu::DeviceType::Cpu)
+    // Android: the Adreno 740's compiler rejects the culling pipeline (its shader forces an early
+    // depth test and writes storage from the fragment stage), which loses the device. Off there
+    // unless `HORIZON_GPU_CULL` (1, all, shader) is set in horizon-env.txt.
+    let by_default = info.device_type != wgpu::DeviceType::Cpu && !cfg!(target_os = "android");
+    env != Some("0") && (env.is_some() || by_default)
 }
 
 /// Whether Translucent Batching is offered (`graphics::offer_translucent_batching`): where
@@ -1778,12 +1782,21 @@ async fn open_backend(
     // (`MC_GL_KHR_shader_subgroup_*`); storage buffers in vertex shaders, clearing and
     // atomics on images: their buffers and images. Filtering 32-bit float textures: shader
     // packs' RGBA32F buffers, which GL filters and mipmaps.
+    // Android: mappable primary buffers make wgpu create every buffer that starts mapped
+    // (`create_buffer_init`) in host-visible memory, which the Adreno 740 driver refuses for an
+    // index buffer ("Quad indices is invalid" at startup). Only the overflow of terrain into
+    // system memory uses the feature, and the renderer checks for it.
+    let mappable = if cfg!(target_os = "android") {
+        wgpu::Features::empty()
+    } else {
+        wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+    };
     let features = timing::GpuTimer::features(&adapter)
         | cull::Cull::features(&adapter)
         | oit::features(&adapter)
         | (adapter.features()
             & (wgpu::Features::INDIRECT_FIRST_INSTANCE
-                | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+                | mappable
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
                 | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                 | wgpu::Features::RG11B10UFLOAT_RENDERABLE
@@ -1859,8 +1872,26 @@ async fn open_backend(
                 log::warn!(
                     "Horizon renderer: the graphics device was lost ({reason:?}: {message})"
                 );
+                // Android: the callback runs where the failing call was made, so the trace names
+                // the pipeline or resource the driver refused (the default would only panic
+                // about an unrelated buffer later).
+                if cfg!(target_os = "android") {
+                    log::error!(
+                        "Horizon renderer: where the device was lost:\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
                 lost.store(true, std::sync::atomic::Ordering::Relaxed);
             });
+            if cfg!(target_os = "android") {
+                // Say why an operation fails, which the default handler turns into a panic.
+                let reported = std::sync::atomic::AtomicU32::new(0);
+                device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                    if reported.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                        log::error!("Horizon renderer: wgpu error: {error}");
+                    }
+                }));
+            }
             Ok(Opened {
                 instance,
                 surface,
@@ -2730,7 +2761,7 @@ impl Renderer {
             &emission_stats.view,
         );
         let index_quads = 1 << 16;
-        let indices = Self::quad_indices(&device, index_quads);
+        let indices = Self::quad_indices(&device, &queue, index_quads);
         let instance_capacity = 4096;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Section origins"),
@@ -3793,7 +3824,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let static_entity_index_quads = 1 << 14;
-        let static_entity_indices = Self::quad_indices(&device, static_entity_index_quads);
+        let static_entity_indices = Self::quad_indices(&device, &queue, static_entity_index_quads);
         let flat_wanted = flat::wanted(&adapter, &device);
         // Metal draws solid terrain in two passes (`split_solid`): meshes put all
         // their opaque quads first, so each pass draws its part in a run or two.
@@ -4213,18 +4244,57 @@ impl Renderer {
         let first = if high_contrast { edges } else { 0 };
         pass.draw(0..4, first..first + edges);
     }
-    fn quad_indices(device: &wgpu::Device, quads: u32) -> wgpu::Buffer {
+    fn quad_indices(device: &wgpu::Device, queue: &wgpu::Queue, quads: u32) -> wgpu::Buffer {
+        // 24 bytes of indices per quad. A request past what the device can allocate (a phone
+        // driver offers much less than a desktop GPU) is logged and capped.
+        let limit = (device.limits().max_buffer_size / 24).min(u64::from(u32::MAX / 4)) as u32;
+        if quads > 1 << 16 || quads > limit {
+            log::info!(
+                "Horizon renderer: index buffer for {quads} quads ({} MB); the device allows {limit} quads",
+                (u64::from(quads) * 24) >> 20
+            );
+        }
+        let quads = if cfg!(target_os = "android") {
+            quads.min(limit)
+        } else {
+            quads
+        };
         let indices: Vec<u32> = (0..quads)
             .flat_map(|q| {
                 let b = q * 4;
                 [b, b + 1, b + 2, b, b + 2, b + 3]
             })
             .collect();
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let bytes: &[u8] = bytemuck::cast_slice(&indices);
+        if !cfg!(target_os = "android") {
+            return device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Quad indices"),
+                contents: bytes,
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        }
+        // Android: created unmapped and filled through the queue: a buffer that starts mapped
+        // (`create_buffer_init`) came out invalid on the Adreno 740, with the reason never
+        // reported. The scopes catch whatever the driver says and log it.
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Quad indices"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        })
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytes);
+        // Native error scopes resolve at once.
+        let out_of_memory = pollster::block_on(memory.pop());
+        let invalid = pollster::block_on(validation.pop());
+        if let Some(error) = out_of_memory.or(invalid) {
+            log::error!(
+                "Horizon renderer: the index buffer ({} bytes) failed: {error}",
+                bytes.len()
+            );
+        }
+        buffer
     }
     fn offscreen_target(
         device: &wgpu::Device,
@@ -4575,7 +4645,7 @@ impl Renderer {
         let max = solid.max(translucent);
         if max > self.index_quads {
             self.index_quads = max.next_power_of_two();
-            self.indices = Self::quad_indices(&self.device, self.index_quads);
+            self.indices = Self::quad_indices(&self.device, &self.queue, self.index_quads);
         }
         let encoder = self.section_copies.get_or_insert_with(|| {
             self.device
@@ -7285,7 +7355,7 @@ impl Renderer {
         if max_static_section_quads > self.static_entity_index_quads {
             self.static_entity_index_quads = max_static_section_quads.next_power_of_two();
             self.static_entity_indices =
-                Self::quad_indices(&self.device, self.static_entity_index_quads);
+                Self::quad_indices(&self.device, &self.queue, self.static_entity_index_quads);
         }
         if !frame.visible_static_block_entity_sections.is_empty()
             && self.static_entity_camera != Some(frame.camera)
@@ -7356,7 +7426,7 @@ impl Renderer {
                 .max(outlined / 4);
         if max_quads > self.index_quads {
             self.index_quads = max_quads.next_power_of_two();
-            self.indices = Self::quad_indices(&self.device, self.index_quads);
+            self.indices = Self::quad_indices(&self.device, &self.queue, self.index_quads);
         }
         if let Some(b) = &frame.border {
             if b.rebuilt {
