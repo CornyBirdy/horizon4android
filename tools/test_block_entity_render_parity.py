@@ -5,7 +5,7 @@ The Java oracle (VanillaBlockEntityRenderOracle) builds each case's vanilla
 block entity, sets its animation fields, runs the real BlockEntityRenderer's
 extractRenderState and submit, and captures what it submits: model vertices
 after setupAnim and the pose stack (sprite-local UVs, tint, normal, light),
-text calls and items. `examples/block_entity_render_fixture` replays the case
+text calls and items. `examples/probe/block_entity_render_fixture` replays the case
 through Horizon's BlockEntityRenderer. Quads are matched by texture and
 position; colours compare vanilla's tint times the entity shader's
 `minecraft_mix_light` for the vanilla normal with Horizon's baked colour.
@@ -46,7 +46,8 @@ def cases():
         out.append(case)
 
     for block in ['chest', 'trapped_chest', 'copper_chest', 'exposed_copper_chest', 'weathered_copper_chest',
-                  'oxidized_copper_chest', 'waxed_copper_chest', 'waxed_oxidized_copper_chest']:
+                  'oxidized_copper_chest', 'waxed_copper_chest', 'waxed_exposed_copper_chest',
+                  'waxed_weathered_copper_chest', 'waxed_oxidized_copper_chest']:
         for facing in HORIZONTAL:
             for kind in ['single', 'left', 'right']:
                 add(f'minecraft:{block}[facing={facing},type={kind}]', open=rng.choice([0.0, 0.25, 0.7, 1.0]))
@@ -117,7 +118,8 @@ def cases():
     for f in HORIZONTAL:
         add(f'minecraft:lectern[facing={f},has_book=true]')
         add(f'minecraft:lectern[facing={f},has_book=false]')
-    for prefix in ['', 'exposed_', 'weathered_', 'oxidized_', 'waxed_']:
+    for prefix in ['', 'exposed_', 'weathered_', 'oxidized_', 'waxed_', 'waxed_exposed_',
+                   'waxed_weathered_', 'waxed_oxidized_']:
         for pose in ['standing', 'running', 'sitting', 'star']:
             add(f'minecraft:{prefix}copper_golem_statue[facing={rng.choice(HORIZONTAL)},copper_golem_pose={pose}]')
     for _ in range(8):
@@ -285,7 +287,7 @@ def main():
     lock, jars, _ = base.verify_artifacts()
     libraries = baking.client_libraries()
     build = lab.LOCAL / 'rust-block-entity-render-parity'; build.mkdir(parents=True, exist_ok=True)
-    resources = lab.LOCAL / 'horizon-client' / '26.3'
+    resources = lab.RESOURCES
     chosen = [c for c in cases() if args.filter in c['block']]
     inputs = build / 'inputs.jsonl'; inputs.write_text(''.join(json.dumps(c) + '\n' for c in chosen))
     classes = build / 'classes'; classes.mkdir(exist_ok=True)
@@ -303,8 +305,8 @@ def main():
     vanilla = [json.loads(l) for l in (build / 'vanilla.jsonl').read_text().splitlines()]
     textures = sorted({s['texture'] for v in vanilla for s in v.get('submits', []) if 'texture' in s})
     (build / 'textures.txt').write_text(''.join(t + '\n' for t in textures))
-    run(['cargo', 'run', '--quiet', '--profile', 'fast', '-p', 'horizon-client', '--example', 'block_entity_render_fixture', '--',
-         resources, inputs, build / 'textures.txt', build / 'rust.jsonl'], 'rust')
+    run(['cargo', 'run', '--quiet', '--profile', 'fast', '-p', 'horizon-client-lib', '--example', 'client_probe', '--',
+         'block_entity_render_fixture', resources, inputs, build / 'textures.txt', build / 'rust.jsonl'], 'rust')
     rust = [json.loads(l) for l in (build / 'rust.jsonl').read_text().splitlines()]
     assert len(vanilla) == len(rust), (len(vanilla), len(rust))
     groups, errors, skipped, passed = {}, {}, {}, 0

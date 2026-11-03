@@ -5,7 +5,7 @@ The Java oracle (VanillaHudOracle) runs vanilla's own code on a stand-in
 client whose player answers from the case, and records every
 GuiGraphicsExtractor blit (sprite, texture, position, size, region, colour,
 pose), fill, text call (string, style runs, position, colour, shadow, pose)
-and hotbar item (slot, position, seed, pose). `examples/hud_fixture` lays
+and hotbar item (slot, position, seed, pose). `examples/probe/hud_fixture` lays
 out the same state with `horizon_client::hud_layout`, `hud_overlays` and
 `chat`; the ordered call lists (and any state read back) must agree.
 
@@ -99,7 +99,7 @@ def main():
     lock, jars, _ = base.verify_artifacts()
     libraries = baking.client_libraries()
     build = lab.LOCAL / 'rust-hud-parity'; build.mkdir(parents=True, exist_ok=True)
-    resources = lab.LOCAL / 'horizon-client' / '26.3'
+    resources = lab.RESOURCES
     chosen = cases(args.count, kinds)
     inputs = build / 'inputs.jsonl'; inputs.write_text(''.join(json.dumps(c) + '\n' for c in chosen))
     classes = build / 'classes'; classes.mkdir(exist_ok=True)
@@ -114,8 +114,8 @@ def main():
          *(PARITY / f'{n}.java' for n in ('ParityData', 'ParityFont', 'VanillaHudOracle'))], 'compile-java')
     run(['java', '-Xmx2G', '-cp', str(classes) + os.pathsep + dependencies, 'dev.horizonlab.parity.VanillaHudOracle',
          inputs, build / 'vanilla.jsonl'], 'vanilla')
-    run(['cargo', 'run', '--quiet', '--profile', 'fast', '-p', 'horizon-client', '--example', 'hud_fixture', '--',
-         resources, inputs, build / 'rust.jsonl'], 'rust')
+    run(['cargo', 'run', '--quiet', '--profile', 'fast', '-p', 'horizon-client-lib', '--example', 'client_probe', '--',
+         'hud_fixture', resources, inputs, build / 'rust.jsonl'], 'rust')
     vanilla = [json.loads(l) for l in (build / 'vanilla.jsonl').read_text().splitlines()]
     rust = [json.loads(l) for l in (build / 'rust.jsonl').read_text().splitlines()]
     assert len(vanilla) == len(rust)

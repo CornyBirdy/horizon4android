@@ -20,7 +20,7 @@ kilobytes whatever the frame rate. Measured numbers are rounded to 3 decimals.
   "app": { "name": "horizon-client", "version": "0.21.0", "commit": "e96e1571" },
   "hardware": {
     "os": "macos", "os_version": "27.0", "arch": "aarch64",
-    "cpu": "Apple M4 Pro", "cpu_threads": 14, "ram_mb": 65536,
+    "cpu": "Apple M4 Pro", "cpu_threads": 14, "cpu_cores": 14, "ram_mb": 65536, "storage": "nvme", "form": "desktop",
     "gpu": { "name": "Apple M4 Pro", "vendor": "apple", "driver": "", "backend": "metal", "kind": "integrated" },
     "display": { "width": 2560, "height": 1440, "scale": 2.0, "refresh_hz": 60 }
   },
@@ -57,17 +57,21 @@ one (histogram edges included) makes it 2.
 **`app`.** What was measured: `name` (`horizon-client`, `horizon-launcher`, `minecraft`), `version`,
 optionally `commit` (Horizon builds) and `mods` (`[{ "name", "version" }]`, vanilla with mods).
 
-**`hardware`.** `os` (`macos`, `linux`, `windows`), `os_version`, `arch`, `cpu` (brand string),
-`cpu_threads`, `ram_mb`; `gpu` (`name`, `vendor`, `driver`, `backend`: `metal`, `vulkan`, `dx12`, `gl`;
-`kind`: `integrated`, `discrete`, `virtual`, `cpu`, `other`) and `display` (the screen the window was on:
-`width`, `height` in physical pixels, `scale`, `refresh_hz`) when known. Any field can be missing.
+**`hardware`.** `os` (`macos`, `linux`, `windows`), `os_version`, `arch`, `cpu` (brand string; on Windows
+without one in the registry, `PROCESSOR_IDENTIFIER`), `cpu_threads`, `cpu_cores` (physical), `cpu_base_mhz` and
+`cpu_boost_mhz` (where the OS gives them; not on Apple silicon), `ram_mb`, `storage` (the drive under the game folder: `nvme`, `ssd`, `hdd`), `form` (`laptop`,
+`desktop`); `gpu` (`name`, `vendor`, `driver`, `backend`: `metal`, `vulkan`, `dx12`, `gl`;
+`kind`: `integrated`, `discrete`, `virtual`, `cpu`, `other`; `vram_mb`, a discrete GPU's own memory) and
+`display` (the screen the window was on: `width`, `height` in physical pixels, `scale`, `refresh_hz`) when
+known. Any field can be missing. On mains or battery is `conditions.power`.
 
 **`conditions`.** What has to match for two reports to be compared, all optional: `scenario`, `seed`,
 `render_distance`, `simulation_distance`, `window` (`[width, height]` actually rendered), `vsync`,
 `fps_cap` (absent: unlimited), `offscreen` (rendered without presenting: not a player number), `repeats`,
 `warmup_s`, `power` (`ac`, `battery`), `load_avg_1m` (before the run; above about 1 the machine was busy),
-`backend` (when forced). Readers compare reports only with equal `scenario`, distances, `window`, `vsync`,
-`fps_cap` and `offscreen`.
+`backend` (when forced). Readers compare reports only with equal `scenario`, `seed`, distances, `window`, `vsync`,
+`fps_cap` and `offscreen`. `tools/perf_bench.py --table` refuses a comparison when these values differ or a required
+value is unknown; an absent `fps_cap` means unlimited. A single report can still be shown without comparison.
 
 **`metrics`.** Scalar measurements, by name; each is a summary over the run's repeats: `n`, `mean`,
 `stdev` (sample standard deviation, null when `n` is 1), `min`, `max`, `ci95` (half-width of the 95%
@@ -84,6 +88,10 @@ confidence interval of the mean, Student's t, null when `n` is 1). The unit is t
 | `tick.mspt`, `tick.tps` | integrated server tick time and rate (planned) |
 | `memory.rss_peak_mb`, `memory.rss_steady_mb` | resident memory: peak over the run, median while flying |
 | `memory.gpu_mb`, `memory.<phase>.gpu_mb` | video memory the game allocated (or NVIDIA attributes to it), where readable |
+| `memory.<phase>.rss_mb` | resident memory, median over that phase's flight (perf_bench) |
+| `cpu.<phase>.p50_ms` | median CPU time of a frame (the frame minus its waits for the GPU, the display and the limiter; Horizon only) |
+| `tick.<phase>.client_ms` | mean time of one client tick during the phase (vanilla: `Minecraft.tick`; Horizon: the frames' tick phase over the ticks run) |
+| `gpu_pass.<phase>.<pass>_ms` | GPU time of one of the game's render passes (`world`, `world_after_culling`, `occlusion_test`, `hud`...), the median of the last 15 timed frames in the 2 s before the flight, at its start; the flight itself is not timed per pass. Not on Metal, where passes overlap |
 | `power.package_w`, `power.battery_drain_pct` | power draw, battery used per hour (laptops; planned) |
 | `thermal.cpu_c`, `thermal.throttled_pct` | temperature, share of the run spent throttled (planned) |
 | `launcher.start_ms` | launcher process start to its first frame (a session) |

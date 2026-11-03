@@ -9,6 +9,7 @@
 //!
 //! On the desktop the touch controls are off unless `HORIZON_TOUCH=1`; there the window
 //! system turns a touch into a mouse click anyway.
+use super::event_loop::EventLoopCtl;
 use super::{Game, Screen};
 use horizon_client::{
     Result, gamepad,
@@ -19,10 +20,8 @@ use horizon_client::{
 };
 use std::time::Instant;
 use winit::{
-    application::ApplicationHandler,
     dpi::PhysicalPosition,
     event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
-    event_loop::ActiveEventLoop,
     keyboard::KeyCode,
 };
 
@@ -116,7 +115,7 @@ impl Game<'_> {
     }
 
     /// Tells the controls the window's size and the hotbar's place, and which kind of screen is open.
-    fn touch_sync(&mut self, event_loop: &ActiveEventLoop) {
+    fn touch_sync(&mut self, event_loop: &dyn EventLoopCtl) {
         if let Some(r) = &self.renderer {
             let (width, height) = (r.config.width, r.config.height);
             let batch = HudBatch::new([width, height]);
@@ -165,7 +164,11 @@ impl Game<'_> {
     }
 
     /// A finger touched the window, moved on it or left it.
-    pub(super) fn touch_event(&mut self, event_loop: &ActiveEventLoop, touch: winit::event::Touch) {
+    pub(super) fn touch_event(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        touch: winit::event::Touch,
+    ) {
         if !self.touch.enabled {
             return;
         }
@@ -194,11 +197,11 @@ impl Game<'_> {
 
     /// Once per loop iteration: the mouse's events from the platform, the touch controls' timers
     /// and the platform's requests (the pointer capture follows the game's own grab).
-    pub(super) fn touch_frame(&mut self, event_loop: &ActiveEventLoop) {
+    pub(super) fn touch_frame(&mut self, event_loop: &dyn EventLoopCtl) {
         // The platform is ending the app: save and leave, as closing the window does.
         if platform::exit_requested() {
             match self.window.as_ref().map(|w| w.id()) {
-                Some(id) => self.window_event(event_loop, id, WindowEvent::CloseRequested),
+                Some(id) => self.touch_window_event(event_loop, id, WindowEvent::CloseRequested),
                 None => event_loop.exit(),
             }
             return;
@@ -219,7 +222,7 @@ impl Game<'_> {
     }
 
     /// A mouse event from the platform, handled like the window's own mouse events.
-    fn platform_pointer(&mut self, event_loop: &ActiveEventLoop, event: PointerEvent) {
+    fn platform_pointer(&mut self, event_loop: &dyn EventLoopCtl, event: PointerEvent) {
         self.last_input = Instant::now();
         match event {
             PointerEvent::Moved { x, y } => {
@@ -253,7 +256,7 @@ impl Game<'_> {
     }
 
     /// Carries out what the controls decided.
-    fn touch_actions(&mut self, event_loop: &ActiveEventLoop, actions: Vec<Action>) {
+    fn touch_actions(&mut self, event_loop: &dyn EventLoopCtl, actions: Vec<Action>) {
         for action in actions {
             if let Err(e) = self.touch_action(event_loop, action) {
                 log::warn!("Horizon: touch control: {e}");
@@ -261,7 +264,7 @@ impl Game<'_> {
         }
     }
 
-    fn touch_action(&mut self, event_loop: &ActiveEventLoop, action: Action) -> Result<()> {
+    fn touch_action(&mut self, event_loop: &dyn EventLoopCtl, action: Action) -> Result<()> {
         match action {
             // Read every tick through `pad_move`.
             Action::Move(_) => {}
@@ -344,7 +347,7 @@ impl Game<'_> {
     }
 
     /// The menu pointer pressed or let go. A press on the on-screen keyboard types its key instead.
-    fn touch_pointer_button(&mut self, event_loop: &ActiveEventLoop, right: bool, down: bool) {
+    fn touch_pointer_button(&mut self, event_loop: &dyn EventLoopCtl, right: bool, down: bool) {
         if down && self.touch_osk_tap() {
             self.touch.swallowing = true;
             return;
@@ -401,11 +404,21 @@ impl Game<'_> {
 
     // ---- synthetic window events: what the pad's menu cursor sends, too ----
 
-    fn touch_cursor_to(&mut self, event_loop: &ActiveEventLoop, x: f32, y: f32) {
+    /// A window event the touch layer makes up (a finger as the mouse): handled as the window's own.
+    fn touch_window_event(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        self.handle_window_event(event_loop, id, event, super::input_trace::InputOrigin::User);
+    }
+
+    fn touch_cursor_to(&mut self, event_loop: &dyn EventLoopCtl, x: f32, y: f32) {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
-        self.window_event(
+        self.touch_window_event(
             event_loop,
             id,
             WindowEvent::CursorMoved {
@@ -417,14 +430,14 @@ impl Game<'_> {
 
     fn touch_mouse_button(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn EventLoopCtl,
         button: MouseButton,
         down: bool,
     ) {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
-        self.window_event(
+        self.touch_window_event(
             event_loop,
             id,
             WindowEvent::MouseInput {
@@ -439,11 +452,11 @@ impl Game<'_> {
         );
     }
 
-    fn touch_wheel(&mut self, event_loop: &ActiveEventLoop, x: f32, y: f32) {
+    fn touch_wheel(&mut self, event_loop: &dyn EventLoopCtl, x: f32, y: f32) {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
-        self.window_event(
+        self.touch_window_event(
             event_loop,
             id,
             WindowEvent::MouseWheel {

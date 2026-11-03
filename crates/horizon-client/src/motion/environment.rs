@@ -1,13 +1,20 @@
 //! Player liquid travel and environmental damage over the shared fluid state.
 use super::*;
+use crate::breathing::{Breath, breathe, drown};
 use horizon_core::random::RandomSource;
 use horizon_world::{
     fluid::FluidKind,
     living_fluid::{LivingFluidWorld, TravelFluidTag},
 };
 impl MotionWorld<'_, '_, '_> {
-    fn environment_hurt(&mut self, source: &str, damage: f32) -> Result<()> {
+    pub(super) fn environment_hurt(&mut self, source: &str, damage: f32) -> Result<()> {
         if self.player.invulnerable || self.player.spectator {
+            return Ok(());
+        }
+        // Frost walker's `damage_immunity`: #burn_from_stepping (magma, campfire).
+        if self.player.burn_from_stepping_immune
+            && matches!(source, "minecraft:hot_floor" | "minecraft:campfire")
+        {
             return Ok(());
         }
         let id = self
@@ -51,12 +58,12 @@ impl MotionWorld<'_, '_, '_> {
             .state(self.block(eye))
             .is_some_and(|state| state.name == "minecraft:bubble_column");
         let submerged = self.player.is_eye_in_fluid(WATER) && !bubble_column;
-        if submerged
+        let drowns = submerged
             && !self.player.status.water_breathing
             && !self.player.status.breath_of_the_nautilus
             && !self.player.invulnerable
-            && !self.player.spectator
-        {
+            && !self.player.spectator;
+        let vanilla = if drowns {
             // decreaseAirSupply's getAttribute: the instance exists from now
             // on, even unmodified.
             let key = self.player.attributes.key("minecraft:oxygen_bonus");
@@ -68,22 +75,44 @@ impl MotionWorld<'_, '_, '_> {
                 .player
                 .attribute("minecraft:oxygen_bonus")?
                 .max(f64::from(self.player.respiration));
-            if oxygen <= 0.0 || self.scene.random.next_double() < 1.0 / (oxygen + 1.0) {
-                self.player.air -= 1;
+            let sparing = oxygen > 0.0 && self.scene.random.next_double() >= 1.0 / (oxygen + 1.0);
+            Breath {
+                can_breathe: false,
+                consume: i32::from(!sparing),
+                refill: 0,
             }
-            if self.player.air <= -20 {
-                self.player.air = 0;
-                self.player.events.push(MotionEvent::Drown);
+        } else {
+            // The nautilus' breath keeps a submerged player's air as it is.
+            let held = submerged
+                && self.player.status.breath_of_the_nautilus
+                && !self.player.status.water_breathing;
+            Breath {
+                can_breathe: true,
+                consume: 1,
+                refill: if held { 0 } else { 4 },
+            }
+        };
+        // LivingBreatheEvent, on the server's copy of the player only.
+        let breath = if self.player.client_side {
+            vanilla
+        } else {
+            breathe(self.player.entity_id as u32, "minecraft:player", vanilla)
+        };
+        // LivingDrownEvent, likewise.
+        if let Some(drowning) = drown(
+            self.player.entity_id as u32,
+            "minecraft:player",
+            &mut self.player.air,
+            breath,
+            !self.player.client_side,
+        ) {
+            self.player.events.push(MotionEvent::Drown);
+            if let Some(damage) = drowning.damage {
                 self.player.events.push(MotionEvent::Health(
-                    crate::health::HealthEvent::DrownDamage(2.0),
+                    crate::health::HealthEvent::DrownDamage(damage),
                 ));
-                self.environment_hurt("minecraft:drown", 2.0)?;
+                self.environment_hurt("minecraft:drown", damage)?;
             }
-        } else if !submerged
-            || !self.player.status.breath_of_the_nautilus
-            || self.player.status.water_breathing
-        {
-            self.player.air = (self.player.air + 4).min(300);
         }
         if self.player.is_in_lava() {
             self.player.ignite_for_ticks(300)?;
@@ -96,7 +125,7 @@ impl MotionWorld<'_, '_, '_> {
     /// take too) and suffocation (`isInWall`, which the caller decides from
     /// the blocks at the eyes).
     pub fn server_hazards_tick(&mut self, in_wall: bool) -> Result<()> {
-        if self.player.position.y < f64::from(crate::chunk::MIN_Y - 64) {
+        if self.player.position.y < f64::from(self.scene.bottom_y() - 64) {
             let id = self
                 .resources
                 .health
@@ -160,6 +189,29 @@ pub(crate) fn fire_contact(
         }
     }
     damage
+}
+/// `CactusBlock.entityInside`: the box (deflated by `1.0E-5`, as in
+/// `Entity.checkInsideBlocks`) touches a cactus; its inside shape is the
+/// whole block.
+pub(crate) fn cactus_contact(
+    world: &World,
+    registry: &horizon_world::registry::BlockRegistry,
+    bounds: Aabb,
+) -> bool {
+    let b = bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5));
+    for x in b.min_position().x.floor() as i32..=b.max_position().x.floor() as i32 {
+        for y in b.min_position().y.floor() as i32..=b.max_position().y.floor() as i32 {
+            for z in b.min_position().z.floor() as i32..=b.max_position().z.floor() as i32 {
+                if registry
+                    .state(world.block(x, y, z))
+                    .is_some_and(|s| s.name == "minecraft:cactus")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 impl LivingFluidWorld for MotionWorld<'_, '_, '_> {
     fn in_water(&mut self) -> Result<bool> {

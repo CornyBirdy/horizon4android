@@ -117,11 +117,23 @@ impl Clicks {
         self.quick_crafting
     }
 
-    /// A press Horizon handled itself (a double click's `PICKUP_ALL`): its
-    /// release clicks nothing more.
+    /// A press another screen control handled (such as a book button or
+    /// double click's `PICKUP_ALL`): its release clicks nothing more.
     pub fn skip_release(&mut self) {
         self.quick_crafting = None;
         self.skip_next_release = true;
+    }
+
+    /// The screen that takes the pointer over starts with its own state:
+    /// `AbstractContainerScreen` holds `isQuickCrafting` and the drag it
+    /// belongs to on the screen, so a screen that opens (or closes) drops
+    /// them. A press whose release never arrived -- the pointer left the
+    /// window -- would otherwise keep the drag running, and `press` answers
+    /// `None` for every later press, so the quick move and the clicks go
+    /// dead on every screen after it.
+    pub fn cancel_drag(&mut self) {
+        self.quick_crafting = None;
+        self.skip_next_release = false;
     }
 
     /// `mouseClicked` (no double click): the `slotClicked` input it sends on
@@ -258,6 +270,43 @@ mod tests {
     }
 
     #[test]
+    fn a_recipe_book_click_does_not_throw_a_carried_stack_after_the_layout_shifts() {
+        let mut clicks = Clicks::default();
+        let button = Target::<usize>::Nothing;
+        // The book button consumes the press while the player carries a stack.
+        assert_eq!(
+            clicks.press(&button, Button::Left, false, false, false),
+            None
+        );
+        clicks.skip_release();
+
+        // Closing the book shifts the inventory before mouseReleased tests the
+        // pointer again; it may now look like an outside click.
+        assert_eq!(
+            clicks.release(
+                &Target::<usize>::Outside,
+                Button::Left,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Release::Nothing
+        );
+    }
+
+    #[test]
+    fn a_creative_page_release_does_not_throw_a_carried_stack() {
+        let mut clicks = Clicks::default();
+        let out = Target::<usize>::Outside;
+        clicks.skip_release();
+        assert_eq!(
+            clicks.release(&out, Button::Left, false, false, false, false),
+            Release::Nothing
+        );
+    }
+
+    #[test]
     fn another_button_cancels_the_drag() {
         let mut clicks = Clicks::default();
         let slot = Target::Slot(3);
@@ -273,6 +322,63 @@ mod tests {
         assert_eq!(
             clicks.release(&slot, Button::Left, false, true, true, false),
             Release::Click(Input::QuickMove)
+        );
+    }
+
+    /// A press whose release never arrives (the pointer left the window, or
+    /// the screen closed first) leaves `isQuickCrafting` set; the next screen
+    /// starts with its own state, as `AbstractContainerScreen` does, so the
+    /// reset the game runs on open/close makes clicks work again.
+    #[test]
+    fn a_lost_release_does_not_wedge_the_next_screen() {
+        let mut clicks = Clicks::default();
+        let slot = Target::<usize>::Slot(3);
+        // Pressed with a stack carried: a quick craft drag starts, and its
+        // release is lost.
+        assert_eq!(clicks.press(&slot, Button::Left, false, false, false), None);
+        assert!(clicks.quick_crafting().is_some());
+        assert_eq!(
+            clicks.press(&slot, Button::Left, true, false, false),
+            None,
+            "the stuck drag swallows the next press"
+        );
+        // A new screen: fresh state, so the press is a normal click again.
+        clicks = Clicks::default();
+        assert!(clicks.quick_crafting().is_none());
+        assert_eq!(
+            clicks.press(&slot, Button::Left, true, false, false),
+            Some(Input::Pickup)
+        );
+    }
+
+    /// #1737: a press whose release never arrives (the pointer left the
+    /// window) leaves `isQuickCrafting` set, and `press` answers `None` for
+    /// every later press, so the Shift quick move and the clicks on the
+    /// inventory go dead. The drag belongs to the screen that has it
+    /// (`AbstractContainerScreen` holds `isQuickCrafting`), so the screen
+    /// that takes the pointer over drops it and the quick move works again.
+    #[test]
+    fn a_lost_release_does_not_wedge_the_quick_move() {
+        let mut clicks = Clicks::default();
+        let slot = Target::<usize>::Slot(3);
+        // Pressed with a stack carried: a quick craft drag starts, and its
+        // release never arrives.
+        assert_eq!(clicks.press(&slot, Button::Left, false, false, false), None);
+        assert!(clicks.quick_crafting().is_some());
+        // The stuck drag swallows the next press: the Shift quick move stops
+        // working and the inventory stops answering.
+        assert_eq!(clicks.press(&slot, Button::Right, true, true, false), None);
+        // The screen that takes the pointer over starts with its own state.
+        clicks.cancel_drag();
+        assert!(clicks.quick_crafting().is_none());
+        // The quick move works again.
+        assert_eq!(
+            clicks.press(&slot, Button::Right, true, true, false),
+            Some(Input::QuickMove)
+        );
+        assert_eq!(
+            clicks.press(&slot, Button::Left, true, false, false),
+            Some(Input::Pickup)
         );
     }
 }

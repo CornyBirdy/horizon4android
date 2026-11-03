@@ -4,7 +4,7 @@
 Builds a scene of slabs, stairs, snow layers, trapdoors, lanterns, glass,
 leaves, water and glowstone in a fresh vanilla world, lets the vanilla light
 engine settle, stops the server so the SkyLight/BlockLight arrays are saved,
-then relights every saved chunk with `examples/light_parity` and requires every
+then relights every saved chunk with `examples/probe/light_parity` and requires every
 value to agree. The example also replays block edits through the incremental
 `light::relight` and checks them against a full relight.
 
@@ -16,10 +16,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from . import lab
+except ImportError:
+    import lab
+
 ROOT = Path(__file__).resolve().parent.parent
 LOCAL = ROOT / '.local'
-RESOURCES = LOCAL / 'horizon-client' / '26.3'
-SERVER = LOCAL / 'minecraft' / '26.3' / 'jars' / 'server.jar'
+RESOURCES = lab.RESOURCES
+SERVER = lab.GAME / 'jars' / 'server.jar'
 
 # Absolute coordinates well above the terrain, inside force-loaded chunks.
 SCENE = [
@@ -86,8 +91,8 @@ def main():
     if not (dimension / 'region').is_dir():
         dimension = run / 'world'
     for extra in (['--chunks', '0', '0', '2', '3'], ['--incremental', '100']):
-        status = subprocess.run(['cargo', 'run', '--quiet', '--profile', 'fast', '-p', 'horizon-client',
-                                 '--example', 'light_parity', '--', str(RESOURCES), str(dimension), *extra],
+        status = subprocess.run(['cargo', 'run', '--quiet', '--profile', 'fast', '-p', 'horizon-client-lib',
+                                 '--example', 'client_probe', '--', 'light_parity', str(RESOURCES), str(dimension), *extra],
                                 cwd=ROOT).returncode
         if status:
             sys.exit('light mismatch against vanilla')

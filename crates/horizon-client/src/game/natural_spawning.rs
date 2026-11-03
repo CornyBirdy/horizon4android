@@ -2,6 +2,7 @@
 //! it reads, the spawning chunks and caps of `ServerChunkCache.tickChunks`,
 //! and the mobs it adds (finalized with the game's `finalizeSpawn`).
 use super::{Dim, Game};
+use horizon_client::vanillagen::VanillaTerrain;
 use horizon_client::{
     biome::{BiomeInfo, SpawnEntry},
     blocks::BlockFacts,
@@ -9,6 +10,7 @@ use horizon_client::{
     mobs::{
         Mob, MobWorld, Species,
         data::{self, MobData},
+        seen_grid::SeenGrid,
         spawn_rules::{Dimension, SpawnLevel},
         spawn_selection::{
             self, Category, Counted, Heightmap, NaturalLevel, SpawnCost, SpawnPlayer, SpawnRequest,
@@ -18,10 +20,23 @@ use horizon_client::{
 };
 use horizon_core::{
     geometry::{Aabb, Vec3},
-    random::{LegacyRandom, RandomSource, WorldgenRandom},
+    random::{LegacyRandom, RandomSource, WorldgenRandom, XoroshiroRandom},
 };
-use horizon_world::registry::BlockStateId;
+use horizon_world::{
+    nbt::{Compound, Tag},
+    registry::BlockStateId,
+};
 use std::collections::HashMap;
+
+/// Reused buffers for one pass over the spawning chunks: the candidate chunks
+/// and the set that keeps each one once. The buffers keep their capacity
+/// between ticks.
+#[derive(Default)]
+pub(super) struct SpawnScratch {
+    pub(super) candidates: Vec<(i32, i32)>,
+    pub(super) seen: horizon_client::fast_hash::FxHashMap<(i32, i32), usize>,
+    pub(super) close: Vec<bool>,
+}
 
 /// A player in the level in place, as spawning and despawning see it.
 pub(super) struct LevelPlayer {
@@ -36,6 +51,11 @@ impl LevelPlayer {
         (self.position.x - x).powi(2)
             + (self.position.y - y).powi(2)
             + (self.position.z - z).powi(2)
+    }
+    /// `Level.hasNearbyAlivePlayer`'s test of one player (any distance for a
+    /// negative range).
+    fn alive_near(&self, x: f64, y: f64, z: f64, range: f64) -> bool {
+        self.alive && !self.spectator && (range < 0.0 || self.distance_sqr(x, y, z) < range * range)
     }
 }
 /// `ChunkMap.euclideanDistanceSquared` below 128 blocks
@@ -65,21 +85,199 @@ pub(super) fn nearest_player(
     best.map(|(p, _)| p)
 }
 
+/// [`nearest_player`] for many positions: the non-spectators by the 64-block
+/// square they stand in, searched ring by ring outwards from the position.
+/// Every mob asks each tick, and with players spread over the map that was a
+/// look at every player for every mob.
+pub(super) struct NearestPlayers<'p> {
+    players: &'p [LevelPlayer],
+    cells: horizon_client::fast_hash::FxHashMap<(i64, i64), Vec<usize>>,
+    /// The cells' bounding box: (x0, z0, x1, z1).
+    bounds: (i64, i64, i64, i64),
+    /// Few players, or one too far out for cells: every question scans.
+    scan: bool,
+}
+impl<'p> NearestPlayers<'p> {
+    const CELL: f64 = 64.0;
+    /// Further out than any world border: such positions are answered by a scan.
+    const FAR: f64 = 1.0e9;
+    pub(super) fn new(players: &'p [LevelPlayer]) -> Self {
+        let mut cells = horizon_client::fast_hash::FxHashMap::<(i64, i64), Vec<usize>>::default();
+        let mut bounds = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        let mut scan = players.len() <= 8;
+        for (i, p) in players.iter().enumerate().filter(|(_, p)| !p.spectator) {
+            if !(p.position.x.abs() < Self::FAR && p.position.z.abs() < Self::FAR) {
+                // Past any world border (or not a number): scans answer.
+                scan = true;
+                break;
+            }
+            let key = Self::cell(p.position.x, p.position.z);
+            cells.entry(key).or_default().push(i);
+            bounds = (
+                bounds.0.min(key.0),
+                bounds.1.min(key.1),
+                bounds.2.max(key.0),
+                bounds.3.max(key.1),
+            );
+        }
+        Self {
+            players,
+            cells,
+            bounds,
+            scan,
+        }
+    }
+    fn cell(x: f64, z: f64) -> (i64, i64) {
+        (
+            (x / Self::CELL).floor() as i64,
+            (z / Self::CELL).floor() as i64,
+        )
+    }
+    /// The same player [`nearest_player`] finds: the nearest, the first in
+    /// the list among equals.
+    pub(super) fn nearest(&self, x: f64, y: f64, z: f64) -> Option<&'p LevelPlayer> {
+        if self.scan || !(x.abs() < Self::FAR && z.abs() < Self::FAR) {
+            return nearest_player(self.players, x, y, z);
+        }
+        if self.cells.is_empty() {
+            return None;
+        }
+        let (qx, qz) = Self::cell(x, z);
+        let (x0, z0, x1, z1) = self.bounds;
+        let last = (qx - x0)
+            .abs()
+            .max((qx - x1).abs())
+            .max((qz - z0).abs())
+            .max((qz - z1).abs());
+        let mut best: Option<(usize, f64)> = None;
+        let mut looked = 0usize;
+        for ring in 0..=last {
+            let mut look = |kx: i64, kz: i64| {
+                looked += 1;
+                for &i in self.cells.get(&(kx, kz)).into_iter().flatten() {
+                    let d = self.players[i].distance_sqr(x, y, z);
+                    if best.is_none_or(|(b, bd)| d < bd || d == bd && i < b) {
+                        best = Some((i, d));
+                    }
+                }
+            };
+            if ring == 0 {
+                look(qx, qz);
+            } else {
+                for k in -ring..=ring {
+                    look(qx + k, qz - ring);
+                    look(qx + k, qz + ring);
+                }
+                for k in 1 - ring..ring {
+                    look(qx - ring, qz + k);
+                    look(qx + ring, qz + k);
+                }
+            }
+            // Everyone in a further ring is more than `ring` cells away on one
+            // axis, so further than the one found.
+            let bound = ring as f64 * Self::CELL;
+            if best.is_some_and(|(_, d)| d <= bound * bound) {
+                break;
+            }
+            if looked > self.players.len() * 4 {
+                return nearest_player(self.players, x, y, z);
+            }
+        }
+        best.map(|(i, _)| &self.players[i])
+    }
+}
+
 /// The game level as natural spawning reads it.
 pub(super) struct GameLevel<'g, 'a> {
     pub(super) game: &'g Game<'a>,
     pub(super) w: MobWorld<'g>,
     /// Every player in the level ([`Game::level_players`]).
     pub(super) players: Vec<LevelPlayer>,
+    /// Where the non-spectators among them are (`getNearestPlayer`).
+    pub(super) nearest: Vec<[f64; 3]>,
     /// Boxes of the mobs this pass created, not yet in the game's list.
     pub(super) pending: std::cell::RefCell<Vec<Aabb>>,
     /// The types and boxes of what a spawner created this tick.
     pub(super) pending_ids: std::cell::RefCell<Vec<(String, Aabb)>>,
+    /// The game's mobs by box, built once a pass has asked more than
+    /// [`SCANNED_QUERIES`] box queries (the mobs do not change while it
+    /// holds the game); the first ones scan, as the build costs a few scans.
+    pub(super) boxes: std::cell::OnceCell<MobBoxes>,
+    pub(super) box_queries: std::cell::Cell<u32>,
+}
+const SCANNED_QUERIES: u32 = 8;
+/// A mob not removed: its index in `Game::mobs`, box, alive, and whether
+/// it is a living shulker.
+type MobBox = (usize, Aabb, bool, bool);
+fn mob_box(i: usize, m: &Mob) -> MobBox {
+    let alive = m.alive();
+    (
+        i,
+        m.bounds(),
+        alive,
+        alive && m.species() == Species::Shulker,
+    )
+}
+/// The boxes of the game's mobs not removed, and a grid over them.
+pub(super) struct MobBoxes {
+    entries: Vec<MobBox>,
+    grid: SeenGrid,
+}
+impl MobBoxes {
+    fn new(mobs: &[Mob]) -> Self {
+        let entries: Vec<_> = mobs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.removed)
+            .map(|(i, m)| mob_box(i, m))
+            .collect();
+        let grid = SeenGrid::new(entries.iter().map(|e| e.1));
+        Self { entries, grid }
+    }
+    /// The entries whose boxes meet `area` (and possibly a few more).
+    fn near(&self, area: Aabb) -> impl Iterator<Item = MobBox> + '_ {
+        let mut near = Vec::new();
+        let indexed = self.grid.candidates(area, &mut near);
+        let all = (!indexed).then(|| self.entries.iter());
+        near.into_iter()
+            .map(|i| self.entries[i as usize])
+            .chain(all.into_iter().flatten().copied())
+    }
 }
 impl GameLevel<'_, '_> {
+    /// The mobs not removed whose boxes may meet `area` (callers test them).
+    fn mobs_near(&self, area: Aabb) -> Box<dyn Iterator<Item = MobBox> + '_> {
+        let asked = self.box_queries.get() + 1;
+        self.box_queries.set(asked);
+        if asked <= SCANNED_QUERIES && self.boxes.get().is_none() {
+            return Box::new(
+                self.game
+                    .mobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| !m.removed)
+                    .map(|(i, m)| mob_box(i, m)),
+            );
+        }
+        Box::new(
+            self.boxes
+                .get_or_init(|| MobBoxes::new(&self.game.mobs))
+                .near(area),
+        )
+    }
     fn biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
         let chunk = self.game.world.chunks.get(&(x >> 4, z >> 4))?;
-        Some(self.game.res.biomes().get(chunk.biome(x, y, z)))
+        Some(world_biomes!(self.game).get(chunk.biome(x, y, z)))
+    }
+    /// The block whose noise cell `BiomeManager.getBiome` reads.
+    fn zoomed(&self, x: i32, y: i32, z: i32) -> [i32; 3] {
+        let zoom = self.game.streaming.biome_zoom;
+        let [qx, qy, qz] = zoom.quart_at_block(horizon_core::position::BlockPos::new(x, y, z));
+        [qx << 2, qy << 2, qz << 2]
+    }
+    fn zoomed_biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
+        let [x, y, z] = self.zoomed(x, y, z);
+        self.biome(x, y, z)
     }
 }
 impl SpawnLevel for GameLevel<'_, '_> {
@@ -95,7 +293,9 @@ impl SpawnLevel for GameLevel<'_, '_> {
     fn block_tag(&self, tag: &str, block: &str) -> bool {
         self.w.block_tag(tag, block)
     }
+    // Level.getBiome: the zoomed biome.
     fn biome_tag(&self, tag: &str, x: i32, y: i32, z: i32) -> bool {
+        let [x, y, z] = self.zoomed(x, y, z);
         self.w.biome_tag(tag, x, y, z)
     }
     fn sky_light(&self, x: i32, y: i32, z: i32) -> i32 {
@@ -137,10 +337,10 @@ impl SpawnLevel for GameLevel<'_, '_> {
 }
 impl NaturalLevel for GameLevel<'_, '_> {
     fn min_y(&self) -> i32 {
-        horizon_client::chunk::MIN_Y
+        self.w.world.bottom_y()
     }
     fn max_y(&self) -> i32 {
-        horizon_client::chunk::MIN_Y + horizon_client::chunk::HEIGHT - 1
+        self.w.world.top_y() - 1
     }
     fn ambient_light(&self) -> f32 {
         match self.game.dim {
@@ -161,11 +361,13 @@ impl NaturalLevel for GameLevel<'_, '_> {
             Category::from_name(&t.category),
         ))
     }
+    // The `natural_mob_spawns` attribute reads the zoomed biome
+    // (fullResolutionBiomes), the spawn probability the noise cell.
     fn biome_spawns(&self, x: i32, y: i32, z: i32) -> Option<&HashMap<String, Vec<SpawnEntry>>> {
-        self.biome(x, y, z).map(|b| &b.spawns)
+        self.zoomed_biome(x, y, z).map(|b| &b.spawns)
     }
     fn spawn_cost(&self, entity: &str, x: i32, y: i32, z: i32) -> Option<SpawnCost> {
-        self.biome(x, y, z)?.spawn_costs.get(entity).copied()
+        self.zoomed_biome(x, y, z)?.spawn_costs.get(entity).copied()
     }
     fn creature_probability(&self, x: i32, y: i32, z: i32) -> f32 {
         self.biome(x, y, z).map_or(0.1, |b| b.creature_probability)
@@ -190,8 +392,8 @@ impl NaturalLevel for GameLevel<'_, '_> {
     fn structure_spawns(&self) -> &StructureSpawns {
         StructureSpawns::shared(&self.game.options.resources)
     }
-    fn nearest_player_distance_sqr(&self, x: f64, y: f64, z: f64) -> Option<f64> {
-        nearest_player(&self.players, x, y, z).map(|p| p.distance_sqr(x, y, z))
+    fn nearest_player_positions(&self) -> &[[f64; 3]] {
+        &self.nearest
     }
     fn respawn(&self) -> Option<[i32; 3]> {
         // The world spawn point lives in the overworld.
@@ -218,12 +420,9 @@ impl NaturalLevel for GameLevel<'_, '_> {
         // getEntityCollisions(null, box): living shulkers are solid.
         let grown = bounds.inflate(Vec3::new(1e-7, 1e-7, 1e-7));
         no_collision_empty(&mut scene, bounds)
-            && !self.game.mobs.iter().any(|m| {
-                m.species() == Species::Shulker
-                    && m.alive()
-                    && !m.removed
-                    && m.bounds().intersects(grown)
-            })
+            && !self
+                .mobs_near(grown)
+                .any(|(_, b, _, shulker)| shulker && b.intersects(grown))
             && !self
                 .pending_ids
                 .borrow()
@@ -238,10 +437,8 @@ impl NaturalLevel for GameLevel<'_, '_> {
         !player
             && !self.pending.borrow().iter().any(|b| b.intersects(bounds))
             && !self
-                .game
-                .mobs
-                .iter()
-                .any(|m| m.alive() && !m.removed && m.bounds().intersects(bounds))
+                .mobs_near(bounds)
+                .any(|(_, b, alive, _)| alive && b.intersects(bounds))
     }
     fn spawn_mobs(&self) -> bool {
         self.game.ui.rules.bool("spawn_mobs")
@@ -262,7 +459,7 @@ impl NaturalLevel for GameLevel<'_, '_> {
                     spawn_selection::heightmap_blocks(self, kind, x, y, z)
                 })
             })
-            .map_or(horizon_client::chunk::MIN_Y, |y| y + 1)
+            .map_or(self.w.world.bottom_y(), |y| y + 1)
     }
     fn pathfindable_land(&self, x: i32, y: i32, z: i32) -> bool {
         self.w.data.state(self.state(x, y, z)).flags & data::LAND != 0
@@ -271,9 +468,7 @@ impl NaturalLevel for GameLevel<'_, '_> {
 impl horizon_client::mobs::spawner::SpawnerLevel for GameLevel<'_, '_> {
     /// `Level.hasNearbyAlivePlayer`, over every player.
     fn alive_player_near(&self, x: f64, y: f64, z: f64, range: f64) -> bool {
-        self.players.iter().any(|p| {
-            p.alive && !p.spectator && (range < 0.0 || p.distance_sqr(x, y, z) < range * range)
-        })
+        self.players.iter().any(|p| p.alive_near(x, y, z, range))
     }
     fn spawner_blocks_work(&self) -> bool {
         self.game.ui.rules.bool("spawner_blocks_work")
@@ -283,10 +478,8 @@ impl horizon_client::mobs::spawner::SpawnerLevel for GameLevel<'_, '_> {
     }
     fn count_entities(&self, id: &str, bounds: Aabb) -> usize {
         let mobs = self
-            .game
-            .mobs
-            .iter()
-            .filter(|m| !m.removed && m.kind.id == id && m.bounds().intersects(bounds))
+            .mobs_near(bounds)
+            .filter(|&(i, b, ..)| self.game.mobs[i].kind.id == id && b.intersects(bounds))
             .count();
         let pending = self
             .pending_ids
@@ -299,12 +492,21 @@ impl horizon_client::mobs::spawner::SpawnerLevel for GameLevel<'_, '_> {
 }
 impl<'a> Game<'a> {
     pub(super) fn natural_level(&self) -> GameLevel<'_, 'a> {
+        let players = self.level_players();
+        let nearest = players
+            .iter()
+            .filter(|p| !p.spectator)
+            .map(|p| [p.position.x, p.position.y, p.position.z])
+            .collect();
         GameLevel {
             game: self,
             w: self.mob_world_base(&[]),
-            players: self.level_players(),
+            players,
+            nearest,
             pending: Default::default(),
             pending_ids: Default::default(),
+            boxes: Default::default(),
+            box_queries: Default::default(),
         }
     }
     /// Creates a mob the spawner accepted, finalized the game's way; the
@@ -335,7 +537,9 @@ impl<'a> Game<'a> {
             mob.persistent = persistent;
             let id = mob.id;
             self.mobs.push(mob);
+            self.native_mobs_joined(self.mobs.len() - 1, true);
             self.enchant_spawn_equipment(id);
+            self.halloween_spawn_head(id);
             if !persistent {
                 self.spawn_jockeys(id, true);
             }
@@ -344,7 +548,18 @@ impl<'a> Game<'a> {
     /// Every player in the level in place: the local player, and the LAN
     /// guests or server players in it.
     pub(super) fn level_players(&self) -> Vec<LevelPlayer> {
-        let mut players: Vec<LevelPlayer> = self.lan.as_ref().map_or_else(Vec::new, |h| {
+        self.level_players_iter().collect()
+    }
+    /// `level_players` one at a time, without collecting them.
+    fn level_players_iter(&self) -> impl Iterator<Item = LevelPlayer> + '_ {
+        let local = self.player_view().map(|p| LevelPlayer {
+            position: p.position,
+            bounds: p.bounds,
+            alive: p.alive,
+            creative: p.creative,
+            spectator: p.spectator,
+        });
+        let guests = self.lan.iter().flat_map(|h| {
             h.hub
                 .guests
                 .iter()
@@ -356,29 +571,32 @@ impl<'a> Game<'a> {
                     creative: g.creative(),
                     spectator: g.spectator(),
                 })
-                .collect()
         });
-        if let Some(p) = self.player_view() {
-            players.insert(
-                0,
-                LevelPlayer {
-                    position: p.position,
-                    bounds: p.bounds,
-                    alive: p.alive,
-                    creative: p.creative,
-                    spectator: p.spectator,
-                },
-            );
-        }
-        players
+        local.into_iter().chain(guests)
+    }
+    /// `Level.hasNearbyAlivePlayer` before a level is built for the spawn
+    /// code: what a spawner asks first, every tick.
+    pub(super) fn alive_player_near(&self, x: f64, y: f64, z: f64, range: f64) -> bool {
+        self.level_players_iter()
+            .any(|p| p.alive_near(x, y, z, range))
     }
     /// `ChunkMap.collectSpawningChunks`: the natural spawn chunk tracker's
     /// chunks (within 8 chunks of a player, `getSpawnCandidateChunks`) that
     /// are ticking and within 128 blocks of a non-spectator. Also returns how
     /// many chunks the tracker holds (`getNaturalSpawnChunkCount`).
-    pub(super) fn spawning_chunks(&self, players: &[LevelPlayer]) -> (i32, Vec<(i32, i32)>) {
-        let mut candidates: Vec<(i32, i32)> = Vec::with_capacity(289 * players.len());
-        let mut seen = horizon_client::fast_hash::FxHashSet::default();
+    pub(super) fn spawning_chunks(
+        &self,
+        players: &[LevelPlayer],
+        scratch: &mut SpawnScratch,
+    ) -> i32 {
+        let candidates = &mut scratch.candidates;
+        candidates.clear();
+        candidates.reserve(289 * players.len());
+        let seen = &mut scratch.seen;
+        seen.clear();
+        seen.reserve(289 * players.len());
+        let close = &mut scratch.close;
+        close.clear();
         for p in players {
             let (pcx, pcz) = (
                 p.position.x.floor() as i32 >> 4,
@@ -387,40 +605,51 @@ impl<'a> Game<'a> {
             for dx in -8..=8 {
                 for dz in -8..=8 {
                     let key = (pcx + dx, pcz + dz);
-                    if seen.insert(key) {
+                    let i = *seen.entry(key).or_insert_with(|| {
+                        let i = candidates.len();
                         candidates.push(key);
-                    }
+                        close.push(false);
+                        i
+                    });
+                    close[i] |= close_enough_for_spawning(p, key);
                 }
             }
         }
         let count = candidates.len() as i32;
         let levels = self.tickets.levels();
+        let mut i = 0;
         candidates.retain(|&(cx, cz)| {
-            levels.loaded_ticking(cx, cz)
-                && super::ticking_chunk(&self.world, cx, cz)
-                && players
-                    .iter()
-                    .any(|p| close_enough_for_spawning(p, (cx, cz)))
+            let keep = close[i]
+                && levels.loaded_ticking(cx, cz)
+                && super::ticking_chunk(&self.world, cx, cz);
+            i += 1;
+            keep
         });
-        (count, candidates)
+        count
     }
     /// `ServerChunkCache.tickChunks`: the spawn state over the loaded mobs,
     /// the categories under their global caps (creatures every 400 ticks),
     /// then `tickSpawningChunk` in the shuffled spawning chunks of every
     /// player: inhabited time, then `spawnForChunk`.
     pub(super) fn spawn_natural(&mut self) {
+        // `tickChunks` does nothing in a Debug world.
+        if self.world_debug {
+            return;
+        }
         let players = self.level_players();
         if players.is_empty() {
             return;
         }
-        let (spawnable, mut chunks) = self.spawning_chunks(&players);
-        for &key in &chunks {
+        let mut scratch = std::mem::take(&mut self.spawn_scratch);
+        let spawnable = self.spawning_chunks(&players, &mut scratch);
+        for &key in &scratch.candidates {
             *self.world.inhabited.entry(key).or_insert(0) += 1;
         }
         let spawn_mobs = self.ui.rules.bool("spawn_mobs");
         let spawn_enemies = self.ui.rules.bool("spawn_monsters");
         let mut random = std::mem::replace(&mut self.world.random, LegacyRandom::new(0));
         let mut pending = Vec::new();
+        let last_state;
         {
             let level = self.natural_level();
             let counted: Vec<Counted> = self
@@ -435,7 +664,8 @@ impl<'a> Game<'a> {
                         m.position.z.floor() as i32,
                     ],
                     is_mob: true,
-                    persistent: m.persistent,
+                    persistent: m.persistent
+                        || horizon_client::mobs::ai::requires_custom_persistence(m),
                 })
                 .collect();
             let players = players
@@ -448,18 +678,19 @@ impl<'a> Game<'a> {
             let mut state = SpawnState::new(&level, spawnable, players, &counted, |cx, cz| {
                 self.world.chunks.contains_key(&(cx, cz))
             });
+            last_state = state.counts();
             let categories = if spawn_mobs {
                 state.filtered_categories(spawn_enemies, self.world.game_time % 400 == 0)
             } else {
                 Vec::new()
             };
             // Util.shuffle.
-            for i in (1..chunks.len()).rev() {
+            for i in (1..scratch.candidates.len()).rev() {
                 let j = random.next_int_bound(i as i32 + 1).unwrap_or(0) as usize;
-                chunks.swap(i, j);
+                scratch.candidates.swap(i, j);
             }
             if !categories.is_empty() {
-                for chunk in chunks {
+                for chunk in scratch.candidates.drain(..) {
                     let mut spawn = |l: &GameLevel, r: &SpawnRequest| {
                         let spawned = l.game.finalize_spawned(r, &mut pending);
                         if let Some(s) = &spawned {
@@ -480,41 +711,144 @@ impl<'a> Game<'a> {
             }
         }
         self.world.random = random;
+        // ServerChunkCache.lastSpawnState, for the debug overlay.
+        self.spawn_counts.insert(self.dim, last_state);
         self.add_spawned(pending, false);
+        self.spawn_scratch = scratch;
     }
     /// `NoiseBasedChunkGenerator.spawnOriginalMobs`: creature packs for a
     /// freshly generated chunk, from the biome at its corner column's top,
-    /// with the chunk's decoration-seeded random (mobs are not generated in
+    /// with the chunk's decoration-seeded random, finalized with the
+    /// region's random as generation adds them (mobs are not generated in
     /// the End).
     pub(super) fn spawn_generation_creatures(&mut self, cx: i32, cz: i32) {
         if !self.world.chunks.contains_key(&(cx, cz)) || self.dim == Dim::End {
             return;
         }
+        let Some(terrain) = self.end.locator() else {
+            return;
+        };
+        // `FlatLevelSource.spawnOriginalMobs` is empty: a superflat world places no packs.
+        if terrain.is_flat() {
+            return;
+        }
+        let mut region = terrain.region_random(cx, cz);
+        let any = region.as_any();
+        let added = if let Some(r) = any.downcast_mut::<LegacyRandom>() {
+            self.generation_creatures(cx, cz, &terrain, r)
+        } else if let Some(r) = any.downcast_mut::<XoroshiroRandom>() {
+            self.generation_creatures(cx, cz, &terrain, r)
+        } else {
+            return;
+        };
+        for nbt in added {
+            self.load_mob(Tag::Compound(nbt), None);
+        }
+    }
+    fn generation_creatures<Q: RandomSource + 'static>(
+        &self,
+        cx: i32,
+        cz: i32,
+        terrain: &VanillaTerrain,
+        region: &mut Q,
+    ) -> Vec<Compound> {
         let mut random = WorldgenRandom::new(LegacyRandom::new(0));
         random.set_decoration_seed(self.level.seed, cx * 16, cz * 16);
-        // The region's own random: no creature's spawn predicate draws from it.
-        let mut rules = LegacyRandom::new(self.level.seed ^ (i64::from(cx) << 32 | i64::from(cz)));
-        let mut pending = Vec::new();
-        {
-            let level = self.natural_level();
-            let source = [cx * 16, level.max_y(), cz * 16];
-            let mut spawn = |l: &GameLevel, r: &SpawnRequest| {
-                let spawned = l.game.finalize_spawned(r, &mut pending);
-                if let Some(s) = &spawned {
-                    l.pending.borrow_mut().push(s.bounds);
+        let mut added = Vec::new();
+        let mut group = None;
+        let level = self.natural_level();
+        let source = [cx * 16, level.max_y(), cz * 16];
+        let mut spawn = |l: &GameLevel, r: &SpawnRequest, region: &mut Q| {
+            // Each pack starts without group data.
+            if r.group_index == 0 {
+                group = None;
+            }
+            let [x, y, z] = r.position;
+            let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+            let biome = l.zoomed_biome(bx, by, bz).map_or("", |b| b.name.as_str());
+            let at = Vec3::new(x, y, z);
+            match terrain.spawn_generated(r.entity, at, r.yaw, biome, region, &mut group) {
+                Some(nbt) => {
+                    added.push(nbt);
+                    true
                 }
-                spawned
-            };
-            spawn_selection::spawn_mobs_for_chunk_generation(
-                &level,
-                source,
-                (cx, cz),
-                &mut random,
-                &mut rules,
-                &mut spawn,
-                &mut |_| {},
+                None => false,
+            }
+        };
+        spawn_selection::spawn_mobs_for_chunk_generation(
+            &level,
+            source,
+            (cx, cz),
+            &mut random,
+            region,
+            &mut spawn,
+            &mut |_| {},
+        );
+        added
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn player(x: f64, y: f64, z: f64, spectator: bool) -> LevelPlayer {
+        LevelPlayer {
+            position: Vec3::new(x, y, z),
+            bounds: Aabb::new(Vec3::new(x, y, z), Vec3::new(x, y, z)),
+            alive: true,
+            creative: false,
+            spectator,
+        }
+    }
+
+    /// The grid finds the same player a look at every one finds, the first of
+    /// two at the same distance included, and never a spectator.
+    #[test]
+    fn nearest_players_find_what_a_scan_finds() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |m: f64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0 * 2.0 * m - m
+        };
+        let mut players: Vec<LevelPlayer> = (0..150)
+            .map(|i| player(next(3_000.0), 64.0 + next(60.0), next(3_000.0), i % 11 == 0))
+            .collect();
+        // Two at the same distance from the origin, the second one first in no cell order.
+        players.push(player(300.0, 64.0, 0.0, false));
+        players.push(player(-300.0, 64.0, 0.0, false));
+        players.push(player(0.0, 64.0, 300.0, false));
+        let grid = NearestPlayers::new(&players);
+        let index = |p: Option<&LevelPlayer>| p.map(|p| std::ptr::from_ref(p) as usize);
+        let mut probes: Vec<(f64, f64, f64)> = (0..400)
+            .map(|_| (next(3_000.0), next(100.0), next(3_000.0)))
+            .collect();
+        probes.extend([(0.0, 64.0, 0.0), (1.0e12, 0.0, 0.0), (f64::NAN, 0.0, 0.0)]);
+        for (x, y, z) in probes {
+            assert_eq!(
+                index(grid.nearest(x, y, z)),
+                index(nearest_player(&players, x, y, z)),
+                "({x}, {y}, {z})"
             );
         }
-        self.add_spawned(pending, true);
+        players.push(player(NearestPlayers::FAR * 2.0, 64.0, 0.0, false));
+        let grid = NearestPlayers::new(&players);
+        assert!(grid.scan);
+        for x in [0.0, NearestPlayers::FAR * 2.0] {
+            assert_eq!(
+                index(grid.nearest(x, 64.0, 0.0)),
+                index(nearest_player(&players, x, 64.0, 0.0))
+            );
+        }
+        let spectators: Vec<LevelPlayer> = (0..20)
+            .map(|i| player(f64::from(i) * 100.0, 0.0, 0.0, true))
+            .collect();
+        assert!(
+            NearestPlayers::new(&spectators)
+                .nearest(0.0, 0.0, 0.0)
+                .is_none()
+        );
     }
 }

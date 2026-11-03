@@ -1,10 +1,12 @@
 //! The widget tree of the open screen for agents (`ui`, `click ID`, `set ID
 //! VALUE`; docs/agent-control.md): what the last frame drew, with ids, and
 //! clicks that go through the same window events as the mouse.
+use super::event_loop::EventLoopCtl;
 use super::{Game, Screen, agent::Handled};
 use horizon_client::{
     Result,
     control::Request,
+    creative::Creative,
     widgets::{self, Kind, Node},
 };
 use serde_json::{Value, json};
@@ -12,11 +14,11 @@ use std::{
     sync::mpsc::Sender,
     time::{Duration, Instant},
 };
-use winit::{event::MouseButton, event_loop::ActiveEventLoop};
+use winit::event::MouseButton;
 
 pub(super) const HELP: &[&str] = &[
     "ui                             every widget of the open screen: id, kind, label, bounds, value",
-    "click ID [right] [shift]       click a widget of ui by its id (slot-N: as click-slot N)",
+    "click ID [right|middle] [shift] click a widget of ui by its id (slot-N: as click-slot N)",
     "set ID VALUE                   move a slider to VALUE (0..1), as a click on its track",
 ];
 
@@ -55,8 +57,9 @@ impl Game<'_> {
     pub(super) fn ui_nodes(&self) -> Vec<Node> {
         let size = self.gui_scale().map(|b| [b.width, b.height]);
         let mut nodes = widgets::tree(&widgets::last_labelled(), &widgets::last_targets(), size);
-        if self.screen == Screen::Inventory
+        if matches!(self.screen, Screen::Inventory | Screen::Creative)
             && self.title.is_none()
+            && self.book.is_none()
             && let Ok((ox, oy)) = self.gui_origin()
         {
             nodes.extend(self.slots().into_iter().map(|i| {
@@ -90,6 +93,11 @@ impl Game<'_> {
                 if let Some(slot) = node.id.strip_prefix("slot-").and_then(|s| s.parse().ok()) {
                     let stack = if slot == 200 {
                         self.craft_result()
+                    } else if slot >= Creative::DISPLAY {
+                        // An item tab's display slot shows the tab's list.
+                        let first = self.creative_screen.first_row(&self.pack.names);
+                        self.creative_screen
+                            .shown(&self.pack.names, first * 9 + slot - Creative::DISPLAY)
                     } else {
                         self.slot_mut(slot).clone()
                     };
@@ -119,7 +127,7 @@ impl Game<'_> {
         words: &[&str],
         line: &str,
         reply: &Sender<String>,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn EventLoopCtl,
     ) -> Result<Handled> {
         if !matches!(words[0], "ui" | "click" | "set") {
             return Ok(Handled::No);
@@ -152,7 +160,8 @@ impl Game<'_> {
                     return Err(format!("widget {:?} is disabled", node.id).into());
                 }
                 let right = words.contains(&"right");
-                if node.kind == Kind::Slot {
+                let middle = words.contains(&"middle");
+                if node.kind == Kind::Slot && !middle {
                     let slot = node.id.trim_start_matches("slot-");
                     let mut click = vec!["click-slot", slot];
                     click.extend(words.iter().filter(|w| matches!(**w, "right" | "shift")));
@@ -162,7 +171,11 @@ impl Game<'_> {
                         node.rect[0] + node.rect[2] / 2.0,
                         node.rect[1] + node.rect[3] / 2.0,
                     );
-                    let button = if right {
+                    // The middle button goes through the window's own
+                    // events at the widget's centre, slots included.
+                    let button = if middle {
+                        MouseButton::Middle
+                    } else if right {
                         MouseButton::Right
                     } else {
                         MouseButton::Left

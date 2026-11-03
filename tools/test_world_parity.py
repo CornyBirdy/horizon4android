@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import tempfile
 
@@ -35,6 +36,8 @@ def main():
     if args.prepare:
         lab.prepare()
     lock, jars, libraries = test_rust_parity.verify_artifacts()
+    for earlier in directory.glob("run-*"):  # one run per run used to stay behind: 5 GB here after a few weeks
+        shutil.rmtree(earlier, ignore_errors=True)
     base = Path(tempfile.mkdtemp(prefix="run-", dir=directory))
     classes = base / "classes"
     classes.mkdir()
@@ -51,12 +54,12 @@ def main():
 
     print("Generating vanilla world-data fixtures...", flush=True)
     print(java("server", "generate").split("HORIZON_WORLD_GENERATED")[-1].strip(), flush=True)
-    run(["cargo", "build", "--release", "-p", "horizon-world", "--bin", "horizon-world", "--example", "world_fixture"], base / "compile-rust.log")
+    run(["cargo", "build", "--release", "-p", "horizon-world", "--bin", "horizon-world", "--example", "world_probe"], base / "compile-rust.log")
     metadata = json.loads(run(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
     target = Path(metadata["target_directory"]) / "release"
     suffix = ".exe" if os.name == "nt" else ""
     binary = target / ("horizon-world" + suffix)
-    run([target / "examples" / ("world_fixture" + suffix), base], base / "rust-fixture.log")
+    run([target / "examples" / ("world_probe" + suffix), "world_fixture", base], base / "rust-fixture.log")
     for network in [False, True]:
         kind = "network" if network else "nbt"
         output = base / "rust" / kind
@@ -96,7 +99,7 @@ def main():
         references.append({"side": side, "jar_sha256": lab.digest(jars[side], "sha256"), **results[0]})
         print(json.dumps(references[-1]), flush=True)
     test_rust_parity.ensure_sources_unchanged(sources, tested_sources)
-    report = {"schema": 1, "minecraft": lock["minecraft"]["version"], "data_version": 5023,
+    report = {"schema": 1, "minecraft": lock["minecraft"]["version"], "data_version": lab.version_info()["world_version"],
               "platform": platform.platform(), "java": run(["java", "--version"]).splitlines()[0],
               "rustc": run(["rustc", "--version"]).strip(), "references": references,
               "sources_sha256": tested_sources,

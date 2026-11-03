@@ -29,12 +29,15 @@ log = "0.4"
 default = ["audio"]
 # Sound through cpal's AAudio backend. Off (`--no-default-features`) if it fails to build or run.
 audio = ["horizon-client/audio"]
-# Mods with code (wasmtime). Off by default on Android; content-only mods work without it.
-mods = ["horizon-client/mods"]
 
-# wgpu-hal 30.0.1 with gfx-rs/wgpu#10124, as in the desktop workspace (see its Cargo.toml).
+# The desktop workspace's patched crates (see its Cargo.toml for why each is there): this crate
+# has a workspace of its own, so they are repeated. wgpu-hal 30.0.1 with gfx-rs/wgpu#10124 and
+# more; naga 30.0.1 with the GLSL front end fixes shader packs need; libmimalloc-sys 0.1.49 with
+# the MSVC POPCNT fix (harmless here, and the lock file expects the patched source).
 [patch.crates-io]
 wgpu-hal = { path = "../../third_party/wgpu-hal" }
+naga = { path = "../../third_party/naga" }
+libmimalloc-sys = { path = "../../third_party/libmimalloc-sys" }
 
 # As the desktop workspace's profiles: line tables keep file:line in backtraces.
 [profile.dev]

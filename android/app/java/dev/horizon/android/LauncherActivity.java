@@ -12,6 +12,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Base64;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -26,8 +27,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import org.json.JSONObject;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
+import java.util.Date;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -41,6 +44,12 @@ import java.util.zip.ZipInputStream;
 public class LauncherActivity extends Activity {
     private static final int PICK_FOLDER = 41;
     private static final int PICK_ZIP = 42;
+    private static final int PICK_SESSION = 43;
+    /**
+     * The imported Microsoft account (the session JSON of docs/api/launch.md), in the app's private
+     * folder, where the game's library finds it: each start hands the game a fresh read-once copy.
+     */
+    private static final String SESSION = "horizon-session.json";
     private static final String MANIFEST = "horizon-resources.json";
 
     private LinearLayout column;
@@ -177,6 +186,8 @@ public class LauncherActivity extends Activity {
             }
         }));
 
+        showAccount();
+
         column.addView(button(ready ? "Start Horizon" : "Start anyway (shows the error)",
                 new View.OnClickListener() {
                     @Override
@@ -209,6 +220,129 @@ public class LauncherActivity extends Activity {
                 + "adb logcat -s Horizon RustStdoutStderr", 12, grey, true));
     }
 
+    // ---- the Microsoft account, for online-mode servers ----------------------------------------
+
+    /**
+     * What the start screen says about the imported account, and the buttons to import or remove
+     * it. The account is made on a computer (android/make-phone-session.bat), because the phone
+     * has no Horizon launcher to sign in with: see ANDROID.md, "Online servers".
+     */
+    private void showAccount() {
+        int white = Color.WHITE;
+        int grey = Color.rgb(170, 170, 180);
+        File file = new File(getFilesDir(), SESSION);
+        column.addView(text("Microsoft account (for online-mode servers)", 16, white, false));
+        if (file.isFile()) {
+            String status;
+            int color = grey;
+            try {
+                JSONObject session = new JSONObject(read(file, 20000));
+                status = "Signed in as " + session.optString("name") + ".";
+                long expires = tokenExpiry(session.optString("access_token"));
+                if (expires > 0 && expires * 1000L < System.currentTimeMillis()) {
+                    status += " The session ran out on " + new Date(expires * 1000L)
+                            + ": make a new one on the computer and import it again.";
+                    color = Color.rgb(255, 200, 120);
+                } else if (expires > 0) {
+                    status += " Valid until " + new Date(expires * 1000L) + ".";
+                }
+            } catch (Exception e) {
+                status = "The imported account cannot be read (" + e.getMessage()
+                        + "). Import it again.";
+                color = Color.rgb(255, 140, 120);
+            }
+            column.addView(text(status, 13, color, false));
+        } else {
+            column.addView(text("Not signed in: only offline-mode servers and your own worlds. "
+                    + "To join an online-mode server, make horizon-session.json on the "
+                    + "computer where you use the Horizon launcher (android/make-phone-session.bat), "
+                    + "send it to this phone and import it here. It lasts about a day.", 13, grey,
+                    false));
+        }
+        column.addView(button(file.isFile() ? "Replace the Microsoft account"
+                : "Import a Microsoft account", new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                pick.addCategory(Intent.CATEGORY_OPENABLE);
+                pick.setType("*/*");
+                startActivityForResult(pick, PICK_SESSION);
+            }
+        }));
+        if (file.isFile()) {
+            column.addView(button("Remove the Microsoft account", new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    new File(getFilesDir(), SESSION).delete();
+                    importResult = "The Microsoft account was removed from this phone.";
+                    show();
+                }
+            }));
+        }
+    }
+
+    /** The {@code exp} (seconds since 1970) of a Minecraft access token, a JWT; 0 when unknown. */
+    private static long tokenExpiry(String token) {
+        try {
+            String[] parts = token.split("\\.");
+            if (parts.length < 2) {
+                return 0;
+            }
+            byte[] body = Base64.decode(parts[1], Base64.URL_SAFE | Base64.NO_PADDING
+                    | Base64.NO_WRAP);
+            return new JSONObject(new String(body, StandardCharsets.UTF_8)).optLong("exp", 0);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** Copies the picked session JSON into the app's private folder, after checking it. */
+    private String importSession(Uri uri) {
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) {
+                return "The Microsoft account could not be opened.";
+            }
+            byte[] bytes = new byte[20001];
+            int length = 0;
+            int n;
+            while (length < bytes.length && (n = in.read(bytes, length, bytes.length - length)) > 0) {
+                length += n;
+            }
+            if (length > 20000) {
+                return "That file is too big to be a session (is it the right file?).";
+            }
+            String text = new String(bytes, 0, length, StandardCharsets.UTF_8);
+            JSONObject session;
+            try {
+                session = new JSONObject(text);
+            } catch (Exception e) {
+                return "That file is not a session: it should be horizon-session.json from "
+                        + "make-phone-session on the computer.";
+            }
+            if (session.optString("name").isEmpty() || session.optString("uuid").isEmpty()
+                    || session.optString("access_token").isEmpty()) {
+                return "That session has no name, uuid or access token.";
+            }
+            File target = new File(getFilesDir(), SESSION);
+            try (OutputStream out = new FileOutputStream(target)) {
+                out.write(text.getBytes(StandardCharsets.UTF_8));
+            }
+            // Only this app may read it (the game refuses a session others can read).
+            target.setReadable(false, false);
+            target.setReadable(true, true);
+            target.setWritable(false, false);
+            target.setWritable(true, true);
+            long expires = tokenExpiry(session.optString("access_token"));
+            if (expires > 0 && expires * 1000L < System.currentTimeMillis()) {
+                return "Imported " + session.optString("name") + ", but its session has already "
+                        + "run out. Make a new one on the computer.";
+            }
+            return "Imported the account of " + session.optString("name") + ".";
+        } catch (Exception e) {
+            return "The account could not be imported: " + e.getMessage();
+        }
+    }
+
     // ---- importing the resources from a folder or zip the player copied to the phone --------
 
     @Override
@@ -218,6 +352,11 @@ public class LauncherActivity extends Activity {
             return;
         }
         final Uri uri = data.getData();
+        if (request == PICK_SESSION) {
+            importResult = importSession(uri);
+            show();
+            return;
+        }
         final boolean zip = request == PICK_ZIP;
         if (request != PICK_FOLDER && !zip) {
             return;

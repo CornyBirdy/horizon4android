@@ -21,8 +21,8 @@ use super::{
     value_provider::IntProvider,
 };
 use crate::registry::BlockStateId;
-pub(crate) use decorator::GROUND_FEATURE_KEY;
 use decorator::TreeDecorator;
+pub(crate) use decorator::{GROUND_FEATURE_KEY, beehive_occupants};
 pub use fallen::FallenTreeFeature;
 use foliage::{FoliageAttachment, FoliagePlacer};
 use horizon_core::{geometry::Direction, random::RandomSource};
@@ -48,6 +48,18 @@ pub(crate) fn read<W: FeatureWorld>(
     position: [i32; 3],
 ) -> TreeResult<BlockStateId, W::Error> {
     world.block(position).map_err(world_error)
+}
+/// `FeatureWorld::scan_column`.
+pub(crate) fn scan_column<W: FeatureWorld>(
+    world: &mut W,
+    position: [i32; 3],
+    step: i32,
+    limit: i32,
+    keep: impl FnMut(BlockStateId) -> bool,
+) -> TreeResult<i32, W::Error> {
+    world
+        .scan_column(position, step, limit, keep)
+        .map_err(world_error)
 }
 pub(crate) fn write<W: FeatureWorld>(
     world: &mut W,

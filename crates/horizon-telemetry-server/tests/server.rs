@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use horizon_telemetry::batch::{self, Batch};
-use horizon_telemetry::payload::{Crash, Payload, Perf, Settings, Source, System, Timings};
+use horizon_telemetry::payload::{
+    Crash, Payload, Perf, Settings, SlowFrames, Source, System, Timings,
+};
 use horizon_telemetry::{Item, outbox};
 use horizon_telemetry_server::store::{self, Store};
 use horizon_telemetry_server::{App, Config, router};
@@ -157,6 +159,94 @@ async fn totals_show_only_groups_with_enough_installs() {
     );
 }
 
+/// Sessions split by hardware class; a class shows only with three installs, and never a raw value.
+#[tokio::test]
+async fn totals_break_down_by_hardware_class() {
+    let s = server(Config {
+        min_install_days: 1,
+        ..generous()
+    });
+    for n in 0..4 {
+        let mut item = perf("NVIDIA GeForce RTX 4080", 12);
+        if let Payload::Perf(p) = &mut item.payload {
+            p.system.ram_gb = if n == 3 { 16 } else { 31 };
+            p.system.vram_mb = 16376;
+            p.system.gpu_kind = "discrete".into();
+            p.system.storage = if n == 3 { "hdd" } else { "nvme" }.into();
+        }
+        assert_eq!(
+            s.post(&install(n), vec![item]).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let totals = s.aggregate().await;
+    let b = &totals["breakdowns"];
+    assert_eq!(
+        b["ram"],
+        serde_json::json!([{"class": "32 GB", "installs": 3, "sessions": 3, "hours": 1.5, "p50_ms": b["ram"][0]["p50_ms"], "p99_ms": b["ram"][0]["p99_ms"]}]),
+        "16 GB has one install: {totals}"
+    );
+    assert!(b["ram"][0]["p50_ms"].as_f64().unwrap() > 8.0);
+    assert_eq!(b["vram"][0]["class"], "16 GB");
+    assert_eq!(b["vram"][0]["installs"], 4);
+    assert_eq!(b["storage"].as_array().unwrap().len(), 1);
+    assert_eq!(b["os"][0]["class"], "linux");
+    assert_eq!(b["gpu_kind"][0]["class"], "discrete");
+    let text = totals.to_string();
+    for raw in ["16376", "570.86", "Fedora", "hdd", &install(0)] {
+        assert!(!text.contains(raw), "{raw} in {text}");
+    }
+}
+
+/// What froze: slow frames by release and step, summed over sessions; a step shows only once
+/// enough installs had it, and never with an install or a machine.
+#[tokio::test]
+async fn slow_frames_show_what_froze_with_enough_installs() {
+    let s = server(Config {
+        min_install_days: 2,
+        ..generous()
+    });
+    let slow = |span: &str, frames, frame_max_ms, span_max_ms| {
+        let mut item = perf("NVIDIA GeForce RTX 4070", 12);
+        if let Payload::Perf(p) = &mut item.payload {
+            p.slow_frames = vec![SlowFrames {
+                span: span.into(),
+                frames,
+                frame_max_ms,
+                span_max_ms,
+            }];
+        }
+        item
+    };
+    for (n, frame_max_ms) in [(0, 900.0), (1, 400.0)] {
+        let item = slow("renderer/r_uploads", 3, frame_max_ms, 300.0);
+        assert_eq!(
+            s.post(&install(n), vec![item]).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let lone = slow("tick/tick_mobs", 1, 260.0, 200.0);
+    assert_eq!(
+        s.post(&install(2), vec![lone]).await,
+        StatusCode::NO_CONTENT
+    );
+    let quiet = perf("NVIDIA GeForce RTX 4070", 12);
+    assert_eq!(
+        s.post(&install(3), vec![quiet]).await,
+        StatusCode::NO_CONTENT
+    );
+    let totals = s.aggregate().await;
+    assert_eq!(
+        totals["slow_frames"],
+        serde_json::json!([{
+            "version": "v2026.10.15", "span": "renderer/r_uploads", "frames": 6, "sessions": 2,
+            "installs": 2, "frame_max_ms": 900.0, "span_max_ms": 300.0,
+        }]),
+        "one install is too few for tick_mobs: {totals}"
+    );
+    assert!(!totals.to_string().contains(&install(0)));
+}
+
 #[tokio::test]
 async fn bad_batches_are_refused() {
     let s = server(generous());
@@ -198,14 +288,45 @@ async fn an_address_is_rate_limited() {
         s.post(&install(9), vec![perf("x", 8)]).await,
         StatusCode::TOO_MANY_REQUESTS
     );
+    let from = |forwarded: &str, real: Option<&str>| {
+        let body = batch::encode(&Batch::new(&install(9), vec![perf("x", 8)]));
+        let mut req = Request::post("/v1/batch")
+            .header("x-forwarded-for", forwarded)
+            .header("content-encoding", "zstd");
+        if let Some(ip) = real {
+            req = req.header("x-real-ip", ip);
+        }
+        req.body(Body::from(body)).unwrap()
+    };
+    // A client can't pick its address: the proxy adds the real one last, or sets X-Real-IP.
+    assert_eq!(
+        s.send(from("198.51.100.7, 203.0.113.9", None)).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        s.send(from("198.51.100.7", Some("203.0.113.9"))).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
     // Another address has its own allowance.
-    let body = batch::encode(&Batch::new(&install(9), vec![perf("x", 8)]));
-    let req = Request::post("/v1/batch")
-        .header("x-forwarded-for", "198.51.100.7, 10.0.0.1")
-        .header("content-encoding", "zstd")
-        .body(Body::from(body))
-        .unwrap();
-    assert_eq!(s.send(req).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.send(from("203.0.113.9, 198.51.100.7", None)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    // Two IPv6 addresses of one /64 share a bucket; another /64 doesn't.
+    for forwarded in ["2001:db8::1", "2001:db8::2", "2001:db8::3"] {
+        assert_eq!(
+            s.send(from(forwarded, None)).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        s.send(from("2001:db8::ffff:ffff", None)).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        s.send(from("2001:db8:1::1", None)).await.0,
+        StatusCode::NO_CONTENT
+    );
 }
 
 #[tokio::test]

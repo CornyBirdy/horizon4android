@@ -35,7 +35,7 @@ spore_blossom_air totem_of_undying underwater vault_connection warped_spore whit
 sweep_attack glow wax_on wax_off electric_spark scrape squid_ink glow_squid_ink item_slime item_snowball item_cobweb
 sulfur_cube_goo firefly trial_spawner_detection trial_spawner_detection_ominous trial_omen raid_omen ominous_spawning
 spit fishing dust_plume red_poplar_leaves orange_poplar_leaves yellow_poplar_leaves pause_mob_growth
-reset_mob_growth""".split()
+reset_mob_growth sulfur_bubbles""".split()
 
 
 def options(kind, rng):
@@ -57,6 +57,10 @@ def options(kind, rng):
         return dict(item=rng.choice(['minecraft:apple', 'minecraft:cooked_beef', 'minecraft:egg']))
     if kind == 'dragon_breath':
         return dict(scale=rng.choice([1.0, 0.25]))
+    if kind in ('geyser', 'geyser_plume'):
+        return dict(water_blocks=rng.choice([1, 2, 3, 5, 8]))
+    if kind in ('geyser_base', 'geyser_poof'):
+        return dict(water_blocks=rng.choice([1, 2, 3, 5, 8]), burst_impulse_base=rng.choice([0.0, 0.25, 0.5, 1.0]))
     if kind == 'sculk_charge':
         return dict(scale=rng.choice([0.0, 1.5707964, 3.1415927]))
     if kind == 'shriek':
@@ -77,6 +81,27 @@ def cases(rng):
         for (pos, floor) in starts:
             for vel in velocities:
                 yield dict(type=kind, options=options(kind, rng), pos=pos, vel=vel, floor=floor,
+                           seed=rng.randrange(-2**63, 2**63), ticks=80)
+    # In still water (sources from y 64 to 67): the bubbles rise until they leave it.
+    for kind in ['sulfur_bubbles', 'bubble', 'bubble_column_up']:
+        for (pos, floor) in [([0.3125, 64.046875, -0.40625], True), ([-5.75, 66.59375, 3.125], False)]:
+            for vel in velocities:
+                yield dict(type=kind, options={}, pos=pos, vel=vel, floor=floor, water=True,
+                           seed=rng.randrange(-2**63, 2**63), ticks=80)
+    # The sulfur geyser and the noxious gas around it: the types whose options carry a water
+    # column (and, on the base and the poof, the burst impulse), the gas the cloud keeps
+    # spawning, and the plume that rises `water_blocks` blocks high.
+    for kind in ['noxious_gas', 'noxious_gas_cloud', 'geyser', 'geyser_plume', 'geyser_base', 'geyser_poof']:
+        for (pos, floor) in starts:
+            for vel in velocities:
+                yield dict(type=kind, options=options(kind, rng), pos=pos, vel=vel, floor=floor,
+                           seed=rng.randrange(-2**63, 2**63), ticks=80)
+    # In still water: the cloud spawns gas where PotentSulfurBlockEntity.canBeReachedByNoxiousGas
+    # finds a water source under the spawn point, drawing the level random for each attempt.
+    for kind in ['noxious_gas', 'noxious_gas_cloud']:
+        for (pos, floor) in [([0.3125, 65.046875, -0.40625], True), ([-5.75, 66.59375, 3.125], False)]:
+            for vel in velocities:
+                yield dict(type=kind, options={}, pos=pos, vel=vel, floor=floor, water=True,
                            seed=rng.randrange(-2**63, 2**63), ticks=80)
 
 
@@ -190,15 +215,15 @@ def main():
     sources = [lab.ROOT / p for p in [
         'tools/test_particle_providers_parity.py', 'tools/oracle_harness.py', 'tools/test_rust_parity.py', 'tools/lab.py',
         f'mods/horizon/src/test/java/dev/horizonlab/parity/{oracle}.java', 'Cargo.toml', 'Cargo.lock',
-        'crates/horizon-client/Cargo.toml', 'crates/horizon-client/src/particles.rs',
-        f'crates/horizon-client/examples/{probe}.rs', 'crates/horizon-core/src/random.rs']]
+        'crates/horizon-client/Cargo.toml', 'crates/horizon-client-render/src/particles.rs',
+        f'crates/horizon-client/examples/probe/{probe}.rs', 'crates/horizon-core/src/random.rs']]
     tested = base.source_hashes(sources)
     cases_path, units = make_cases(build)
     classes, dependencies, _ = harness.compile_oracle(build, oracle, jars, libraries, lock['minecraft']['java_major'])
-    binary = harness.build_probe(build, probe)
+    command = harness.build_probe(build, probe)
     # The oracle runs first: the probe replays the particle seeds it recovered.
     harness.java_run(build, classes, dependencies, oracle, [cases_path, build / 'client.txt'], 'client')
-    harness.run_logged([binary, cases_path, build / 'client.txt', build / 'rust.txt'], build, 'rust')
+    harness.run_logged([*command, cases_path, build / 'client.txt', build / 'rust.txt'], build, 'rust')
     tolerance = 0
     try:
         matched = base.compare(build / 'client.txt', build / 'rust.txt')
@@ -215,10 +240,12 @@ def main():
         client_jar_sha256=lab.digest(jars['client'], 'sha256'), matched_output_lines=matched,
         output_sha256=lab.digest(build / 'rust.txt', 'sha256'), libm_tolerated_lines=tolerance,
         scope=('Real ParticleResources providers for every type Horizon implements, ticked in an air level with an optional '
-               'stone floor: construction (provider, level, SpellParticle and particle-local random draws), per-tick '
+               'stone floor and, for the bubbles, still water: construction (provider, level, SpellParticle and particle-local random draws), per-tick '
                'position, previous position, motion, age, lifetime, removal, onGround, quad size at partial 0 and 0.5, '
                'colour, alpha, roll, sprite, UVs and light at partial 0.5 (unloaded chunk), and the particles and sounds '
-               'requested from the level. Fluids, block light, render layers/facing and the ParticleEngine group limits '
+               'requested from the level. The geyser eruption throws its base, plume and poof from the water column it '
+               'carries and the plume rises that many blocks; the noxious gas cloud asks the still water for each gas it '
+               'spawns. Flowing fluids, block light, render layers/facing and the ParticleEngine group limits '
                'are not exercised.')))
     print(f'{units:,} particle cases match the pinned client ({matched:,} output lines, {tolerance} within '
           f'the libm tolerance): {report}', flush=True)

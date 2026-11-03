@@ -158,7 +158,8 @@ const COLUMNS: [(&str, &str); 6] = [
 #[derive(Default)]
 pub(super) struct StatsUi {
     tab: usize,
-    scroll: f32,
+    /// The list's scrolling: the wheel and the held scrollbar.
+    scroll: horizon_client::ui::Scroll,
     sort: Option<(usize, i32)>,
 }
 /// `MenuTabBar` geometry: three tabs over at most 400 pixels.
@@ -182,11 +183,29 @@ impl Game<'_> {
         self.stats_ui = StatsUi::default();
         self.screen = Screen::Stats;
     }
+    /// The list's scrollbar column (right of the 280 pixel list) and the
+    /// pixels it scrolls.
+    fn stats_bar(w: f32) -> f32 {
+        ((w - 280.0) / 2.0).floor() + 280.0 + 6.0
+    }
+    fn stats_content(&self) -> f32 {
+        let (row_h, rows) = self.stats_rows();
+        row_h * rows as f32 + 4.0
+    }
     fn stats_rows(&self) -> (f32, usize) {
         match self.stats_ui.tab {
             0 => (14.0, CUSTOM.len()),
             1 => (22.0, self.stat_items().len() + 1),
             _ => (36.0, self.stat_mobs().len()),
+        }
+    }
+    /// Whether tab `i` can be chosen: the Items and Mobs tabs are active only
+    /// while their list has rows.
+    fn stats_tab_active(&self, i: usize) -> bool {
+        match i {
+            1 => !self.stat_items().is_empty(),
+            2 => !self.stat_mobs().is_empty(),
+            _ => true,
         }
     }
     /// Items (and block items) with any non-zero column.
@@ -220,21 +239,86 @@ impl Game<'_> {
         }
         mobs
     }
+    /// `MobRow`: the mob's name, its kills and killed-by lines, and their
+    /// colours (grey when none).
+    fn mob_row(&self, mob: &str) -> (Text, Text, Text, (u32, u32)) {
+        let name = Text::translate(&format!("entity.{}", mob.replace(':', ".")), &[]);
+        let kills = self.stats.get("killed", mob);
+        let by = self.stats.get("killed_by", mob);
+        let k = if kills == 0 {
+            Text::translate(
+                "stat_type.minecraft.killed.none",
+                std::slice::from_ref(&name),
+            )
+        } else {
+            Text::translate(
+                "stat_type.minecraft.killed",
+                &[Text::literal(kills.to_string()), name.clone()],
+            )
+        };
+        let b = if by == 0 {
+            Text::translate(
+                "stat_type.minecraft.killed_by.none",
+                std::slice::from_ref(&name),
+            )
+        } else {
+            Text::translate(
+                "stat_type.minecraft.killed_by",
+                &[name.clone(), Text::literal(by.to_string())],
+            )
+        };
+        let colors = (
+            if kills > 0 { 0xFFBA_BABA } else { 0xFF80_8080 },
+            if by > 0 { 0xFFBA_BABA } else { 0xFF80_8080 },
+        );
+        (name, k, b, colors)
+    }
     pub(super) fn draw_stats(&mut self, batch: &mut HudBatch) {
+        horizon_client::widgets::begin_screen(|| {
+            horizon_client::widgets::ScreenInfo::new(
+                "stats",
+                super::screen_info::tr("gui.stats", &[]),
+            )
+        });
         let (w, h) = (batch.width, batch.height);
         let atlas = &self.gui.atlas;
         ui::menu_background(batch, atlas, 0.0, 0.0, w, h, true);
         let (top, bottom) = (TAB_H, h - FOOTER);
         ui::separators(batch, atlas, top, bottom, true);
         // The tab bar.
+        let mut tab_tip = false;
         let (x0, tw) = tabs(w);
-        for (i, key) in ["stat.generalButton", "stat.itemsButton", "stat.mobsButton"]
-            .into_iter()
-            .enumerate()
-        {
+        const TABS: [&str; 3] = ["stat.generalButton", "stat.itemsButton", "stat.mobsButton"];
+        // Its TabNavigationBar: the hovered tab, else the current one (a
+        // GridLayoutTab's extra narration is empty).
+        horizon_client::widgets::narratable(|| {
+            use horizon_client::widgets::{ListKind, Narratable, Row, What};
+            let row = |i: usize| {
+                let mut row = Row::new(i, Text::translate(TABS[i], &[]).plain());
+                row.hint = Some(String::new());
+                row
+            };
+            let hovered = (0..TABS.len())
+                .find(|&i| ui::hovered(self.cursor, x0 + tw * i as f32, 0.0, tw, TAB_H));
+            Narratable::new(
+                What::List {
+                    kind: ListKind::Tabs,
+                    total: TABS.len(),
+                    hovered: hovered.map(row),
+                    selected: Some(row(self.stats_ui.tab.min(TABS.len() - 1))),
+                },
+                [x0, 0.0, tw * TABS.len() as f32, TAB_H],
+            )
+            .key(horizon_client::widgets::key_of(&"stats/tabs"))
+        });
+        for (i, key) in TABS.into_iter().enumerate() {
             let x = x0 + tw * i as f32;
             let selected = self.stats_ui.tab == i;
+            let active = self.stats_tab_active(i);
             let hover = ui::hovered(self.cursor, x, 0.0, tw, TAB_H);
+            if hover && !active {
+                tab_tip = true;
+            }
             let sprite = match (selected, hover) {
                 (true, true) => "gui/sprites/widget/tab_selected_highlighted",
                 (true, false) => "gui/sprites/widget/tab_selected",
@@ -242,16 +326,14 @@ impl Game<'_> {
                 (false, false) => "gui/sprites/widget/tab",
             };
             ui::nine_slice(batch, atlas, sprite, x, 0.0, tw, TAB_H, u32::MAX);
-            let label = Text::translate(key, &[]);
-            let lw = atlas.font.width_text(&label);
-            let color = if selected { u32::MAX } else { 0xFFA0_A0A0 };
-            batch.text_styled(
+            ui::menu_tab_label(
+                batch,
                 atlas,
-                &label,
-                (x + (tw - lw) / 2.0).floor(),
-                8.0,
-                color,
-                true,
+                &Text::translate(key, &[]),
+                (x, 0.0, tw, TAB_H),
+                selected,
+                active,
+                horizon_client::hud_overlays::now_ms(),
             );
             if selected {
                 batch.fill(atlas, x + 2.0, TAB_H - 3.0, tw - 4.0, 1.0, u32::MAX);
@@ -260,12 +342,32 @@ impl Game<'_> {
         // The list.
         let (row_h, rows) = self.stats_rows();
         let content = row_h * rows as f32 + 4.0;
-        let max_scroll = (content - (bottom - top)).max(0.0);
-        self.stats_ui.scroll = self.stats_ui.scroll.clamp(0.0, max_scroll);
+        self.stats_ui.scroll.clamp(top, bottom, content);
         let left = ((w - 280.0) / 2.0).floor();
-        let scroll = self.stats_ui.scroll;
+        let scroll = self.stats_ui.scroll.amount;
         let row_y = |i: usize| top + 4.0 + i as f32 * row_h - scroll;
         let visible = |y: f32| y >= top && y + row_h <= bottom;
+        // The list's row under the mouse (`getHovered`).
+        let hovered_row = {
+            let (cx, cy) = self.cursor;
+            let i = ((cy - (top + 4.0) + scroll) / row_h).floor();
+            let inside = cy >= top && cy < bottom && cx >= left && cx < left + 280.0;
+            (inside && i >= 0.0 && (i as usize) < rows).then_some(i as usize)
+        };
+        let list_rect = [0.0, top, w, bottom - top];
+        let list_key = horizon_client::widgets::key_of(&("stats/list", self.stats_ui.tab));
+        let tr = super::screen_info::tr;
+        // GeneralStatisticsList and MobsStatisticsList: ObjectSelectionLists
+        // narrating the hovered row (none is selected).
+        let object_list = |narration: &dyn Fn(usize) -> String| {
+            horizon_client::widgets::narratable(|| {
+                use horizon_client::widgets::{ListKind, Narratable, Row};
+                let hovered = hovered_row.map(|i| Row::new(i, narration(i)));
+                Narratable::list(ListKind::Object, rows, hovered, None, list_rect).key(list_key)
+            });
+        };
+        // The hovered item's tooltip, drawn over the list.
+        let mut tip = None;
         match self.stats_ui.tab {
             0 => {
                 let mut sorted: Vec<(Text, String)> = CUSTOM
@@ -277,6 +379,10 @@ impl Game<'_> {
                     })
                     .collect();
                 sorted.sort_by_key(|(l, _)| l.plain());
+                object_list(&|i| {
+                    let (label, value) = &sorted[i];
+                    tr("narrator.select", &[&format!("{} {value}", label.plain())])
+                });
                 for (i, (label, value)) in sorted.iter().enumerate() {
                     let y = row_y(i);
                     if !visible(y) {
@@ -301,12 +407,35 @@ impl Game<'_> {
                 if items.is_empty() {
                     return self.draw_stats_footer(batch, w, h);
                 }
+                // ItemStatisticsList, a ContainerObjectSelectionList: the
+                // header's sort buttons and each row's item.
+                horizon_client::widgets::narratable(|| {
+                    horizon_client::widgets::Narratable::container_list(
+                        rows,
+                        hovered_row,
+                        list_rect,
+                    )
+                    .key(list_key)
+                });
                 // The header row of sort buttons.
                 let y = row_y(0);
                 if visible(y) {
-                    for (c, (_, sprite)) in COLUMNS.iter().enumerate() {
+                    for (c, (ty, sprite)) in COLUMNS.iter().enumerate() {
                         let x = left + 75.0 + 40.0 * c as f32 - 18.0;
                         let hover = ui::hovered(self.cursor, x, y + 1.0, 18.0, 18.0);
+                        // StatSortButton: an ImageButton named by its stat
+                        // type, which is its tooltip too.
+                        horizon_client::widgets::narratable(|| {
+                            let name = tr(&format!("stat_type.minecraft.{ty}"), &[]);
+                            horizon_client::widgets::Narratable::button(
+                                name.clone(),
+                                [x, y + 1.0, 18.0, 18.0],
+                                true,
+                            )
+                            .hint(name)
+                            .key(horizon_client::widgets::key_of(&("stats/sort", c)))
+                            .child_of(list_key, 0)
+                        });
                         let bg = if hover {
                             "gui/sprites/statistics/header"
                         } else {
@@ -332,6 +461,18 @@ impl Game<'_> {
                         continue;
                     }
                     let stack = ItemStack::new(item, 1);
+                    // ItemRowWidget, an ItemDisplayWidget: "Item: <name>".
+                    horizon_client::widgets::narratable(|| {
+                        let names = |id: &str| self.pack.names.display_item(id);
+                        let name = horizon_client::stations::hover_name(&names, &stack);
+                        horizon_client::widgets::Narratable::text(
+                            tr("narration.item", &[&name]),
+                            [left + 1.0, y + 1.0, 18.0, 18.0],
+                        )
+                        .key(horizon_client::widgets::key_of(&("stats/item", item)))
+                        .child_of(list_key, i + 1)
+                        .without_tooltip()
+                    });
                     batch.sprite(
                         &self.gui.atlas,
                         "gui/sprites/container/slot",
@@ -339,6 +480,10 @@ impl Game<'_> {
                         y + 1.0,
                     );
                     self.draw_item(batch, &stack, left + 2.0, y + 2.0);
+                    // `ItemRowWidget.extractTooltip`: the item's tooltip at the slot's corner.
+                    if ui::hovered(self.cursor, left + 1.0, y + 1.0, 18.0, 18.0) {
+                        tip = Some((stack.clone(), left + 19.0, y + 19.0));
+                    }
                     let atlas = &self.gui.atlas;
                     let color = if (i + 1) % 2 == 0 {
                         u32::MAX
@@ -364,41 +509,22 @@ impl Game<'_> {
                 }
             }
             _ => {
-                for (i, mob) in self.stat_mobs().iter().enumerate() {
+                let mobs = self.stat_mobs();
+                object_list(&|i| {
+                    let (_, kills, killed_by, _) = self.mob_row(&mobs[i]);
+                    let both = horizon_client::widgets::join_for_narration(&[
+                        &kills.plain(),
+                        &killed_by.plain(),
+                    ]);
+                    tr("narrator.select", &[&both])
+                });
+                for (i, mob) in mobs.iter().enumerate() {
                     let y = row_y(i);
                     if !visible(y) {
                         continue;
                     }
-                    let name = Text::translate(&format!("entity.{}", mob.replace(':', ".")), &[]);
+                    let (name, k, b, (ck, cb)) = self.mob_row(mob);
                     batch.text_styled(atlas, &name, left + 2.0, y + 1.0, u32::MAX, true);
-                    let kills = self.stats.get("killed", mob);
-                    let by = self.stats.get("killed_by", mob);
-                    let k = if kills == 0 {
-                        Text::translate(
-                            "stat_type.minecraft.killed.none",
-                            std::slice::from_ref(&name),
-                        )
-                    } else {
-                        Text::translate(
-                            "stat_type.minecraft.killed",
-                            &[Text::literal(kills.to_string()), name.clone()],
-                        )
-                    };
-                    let b = if by == 0 {
-                        Text::translate(
-                            "stat_type.minecraft.killed_by.none",
-                            std::slice::from_ref(&name),
-                        )
-                    } else {
-                        Text::translate(
-                            "stat_type.minecraft.killed_by",
-                            &[name.clone(), Text::literal(by.to_string())],
-                        )
-                    };
-                    let (ck, cb) = (
-                        if kills > 0 { 0xFFBA_BABA } else { 0xFF80_8080 },
-                        if by > 0 { 0xFFBA_BABA } else { 0xFF80_8080 },
-                    );
                     batch.text_styled(atlas, &k, left + 12.0, y + 10.0, ck, true);
                     batch.text_styled(atlas, &b, left + 12.0, y + 19.0, cb, true);
                 }
@@ -408,13 +534,23 @@ impl Game<'_> {
         ui::scrollbar(
             batch,
             atlas,
-            left + 280.0 + 6.0,
+            Self::stats_bar(w),
             top,
             bottom,
             content,
-            self.stats_ui.scroll,
+            self.stats_ui.scroll.amount,
         );
         self.draw_stats_footer(batch, w, h);
+        if let Some((stack, x, y)) = tip {
+            self.draw_stack_tooltip(batch, &stack, x, y);
+        }
+        // The empty tab's Tooltip.create(gui.stats.none_found).
+        if tab_tip {
+            let atlas = &self.gui.atlas;
+            let tip = Text::translate("gui.stats.none_found", &[]);
+            // Tooltip.splitTooltip: font.split(message, 170).
+            ui::tooltip(batch, atlas, &atlas.font.split(&tip, 170.0), self.cursor);
+        }
     }
     fn draw_stats_footer(&self, batch: &mut HudBatch, w: f32, h: f32) {
         let atlas = &self.gui.atlas;
@@ -433,15 +569,20 @@ impl Game<'_> {
         );
     }
     pub(super) fn stats_click(&mut self, size: [u32; 2]) {
+        // A press on the scrollbar holds it and clicks nothing else.
+        if self.stats_press_scrollbar(size) {
+            return;
+        }
         let b = HudBatch::new(size);
         let (w, h) = (b.width, b.height);
         let (x0, tw) = tabs(w);
         for i in 0..3 {
             if ui::hovered(self.cursor, x0 + tw * i as f32, 0.0, tw, TAB_H)
                 && self.stats_ui.tab != i
+                && self.stats_tab_active(i)
             {
                 self.stats_ui.tab = i;
-                self.stats_ui.scroll = 0.0;
+                self.stats_ui.scroll.amount = 0.0;
                 self.audio
                     .play("minecraft:ui.button.click", None, 0.25, 1.0);
                 return;
@@ -461,7 +602,7 @@ impl Game<'_> {
         }
         if self.stats_ui.tab == 1 {
             let left = ((w - 280.0) / 2.0).floor();
-            let y = TAB_H + 4.0 - self.stats_ui.scroll;
+            let y = TAB_H + 4.0 - self.stats_ui.scroll.amount;
             for c in 0..COLUMNS.len() {
                 let x = left + 75.0 + 40.0 * c as f32 - 18.0;
                 if ui::hovered(self.cursor, x, y + 1.0, 18.0, 18.0) {
@@ -479,6 +620,35 @@ impl Game<'_> {
     }
     pub(super) fn stats_scroll(&mut self, amount: f32) {
         let (row_h, _) = self.stats_rows();
-        self.stats_ui.scroll -= amount * row_h / 2.0;
+        let h = self.gui_size().1;
+        let content = self.stats_content();
+        self.stats_ui
+            .scroll
+            .wheel(amount, row_h / 2.0, TAB_H, h - FOOTER, content);
+    }
+    /// A press on the statistics list's scrollbar holds it
+    /// (`AbstractSelectionList.updateScrolling`).
+    pub(super) fn stats_press_scrollbar(&mut self, size: [u32; 2]) -> bool {
+        let b = HudBatch::new(size);
+        let (w, h) = (b.width, b.height);
+        let content = self.stats_content();
+        self.stats_ui
+            .scroll
+            .press(self.cursor, Self::stats_bar(w), TAB_H, h - FOOTER, content)
+    }
+    /// The pointer moved while the scrollbar is held.
+    pub(super) fn stats_drag(&mut self) {
+        if !self.stats_ui.scroll.held() {
+            return;
+        }
+        let h = self.gui_size().1;
+        let content = self.stats_content();
+        self.stats_ui
+            .scroll
+            .drag(self.cursor.1, TAB_H, h - FOOTER, content);
+    }
+    /// The button came up: the scrollbar lets go.
+    pub(super) fn stats_release(&mut self) {
+        self.stats_ui.scroll.release();
     }
 }

@@ -1,4 +1,4 @@
-//! Horizon's initial simulation primitives, targeting Minecraft Java Edition 26.3.
+//! Horizon's initial simulation primitives, targeting the Minecraft Java Edition version in [`version`].
 //!
 //! This is not a playable game. Differential checks cover only the operations
 //! listed in docs/rust-parity.md; the rest of vanilla remains unimplemented.
@@ -7,14 +7,20 @@
 pub mod biome;
 pub mod carving;
 pub mod density;
+pub mod fast_hash;
 pub mod geometry;
 pub mod jmath;
+pub mod no_ai;
 pub mod noise;
 pub mod paletted;
 pub mod position;
+pub mod prepared_files;
 pub mod random;
 pub mod storage;
 pub mod text;
 pub mod ticks;
 
-pub const VANILLA_VERSION: &str = "26.3";
+pub mod release;
+pub mod version;
+
+pub use version::VANILLA_VERSION;

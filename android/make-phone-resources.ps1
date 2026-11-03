@@ -46,7 +46,9 @@ if (-not $tar) { Die 'tar.exe was not found (it ships with Windows 10 and 11).' 
 Write-Host "Packing $Resources"
 Write-Host "  -> $Out   (this can take a few minutes)"
 if (Test-Path $Out) { Remove-Item $Out -Force }
-& tar.exe -a -c -f $Out -C $Resources .
+# horizon-data.bin is the game's cache of these files, written for this computer's folder path: the
+# phone writes its own on the first start, so it is left out (it would only make the zip bigger).
+& tar.exe -a -c -f $Out --exclude horizon-data.bin -C $Resources .
 if ($LASTEXITCODE -ne 0) { Die "tar failed with exit code $LASTEXITCODE" }
 
 $size = [math]::Round((Get-Item $Out).Length / 1MB)

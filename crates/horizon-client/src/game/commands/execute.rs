@@ -32,6 +32,8 @@ pub(in crate::game) struct Source {
     /// The command block whose output this source is
     /// (`BaseCommandBlock.CloseableCommandBlockSource`).
     pub block: Option<(i32, i32, i32)>,
+    /// The command block minecart whose output this source is.
+    pub cart: Option<u32>,
 }
 
 /// Where `execute store` writes.
@@ -64,6 +66,17 @@ pub(in crate::game) struct ExecState {
     pub function_depth: u32,
 }
 
+/// A modifier that brings the sources to `max_command_forks` ends the chain
+/// (`BuildContexts.ERROR_FORK_LIMIT_REACHED`); the error is only shown when
+/// no fork came before it (`CommandSourceStack.handleError`).
+fn fork_limit_reached(forked: bool, limit: usize) -> R<i32> {
+    if forked {
+        Ok(0)
+    } else {
+        Err(err("command.forkLimit", &[&limit]))
+    }
+}
+
 /// Java's `(int)`/`(short)`/`(byte)` narrowing of a double.
 fn java_int(v: f64) -> i32 {
     v as i32
@@ -83,6 +96,7 @@ impl Game<'_> {
             dimension: self.dim,
             level: None,
             block: None,
+            cart: None,
         }
     }
     /// The server as a source (function ticks and schedules): the world spawn.
@@ -97,9 +111,10 @@ impl Game<'_> {
             dimension: self.dim,
             level: None,
             block: None,
+            cart: None,
         }
     }
-    pub(super) fn target_rotation(&self, t: Target) -> [f32; 2] {
+    pub(in crate::game) fn target_rotation(&self, t: Target) -> [f32; 2] {
         match t {
             Target::Player => [self.yaw, self.pitch],
             Target::Guest(conn) => self
@@ -133,7 +148,7 @@ impl Game<'_> {
             _ => [0.0; 2],
         }
     }
-    pub(super) fn target_eye_height(&self, t: Target) -> f64 {
+    pub(in crate::game) fn target_eye_height(&self, t: Target) -> f64 {
         match t {
             Target::Player => self
                 .player
@@ -145,8 +160,41 @@ impl Game<'_> {
                 .iter()
                 .find(|m| m.id == id)
                 .map_or(0.0, |m| m.eye_y() - m.position.y),
-            _ => 0.0,
+            // ArmorStand.getDefaultDimensions: a marker's are empty, a small
+            // stand's are BABY_DIMENSIONS, whose eye height is 0.9875F.
+            Target::Stand(id) => match self.armor_stands.iter().find(|a| a.id == id) {
+                Some(a) if a.marker => 0.0,
+                Some(a) if a.small => f64::from(0.9875f32),
+                _ => self.type_eye_height(&self.target_type(t)),
+            },
+            // Entity.getEyeHeight: the type's dimensions.
+            _ => self.type_eye_height(&self.target_type(t)),
         }
+    }
+    /// `EntityType.getDimensions().eyeHeight()` from `entity-types.json`,
+    /// read once: a float, widened as `Entity.getEyeY` does.
+    fn type_eye_height(&self, ty: &str) -> f64 {
+        static EYE_HEIGHTS: std::sync::OnceLock<std::collections::HashMap<String, f64>> =
+            std::sync::OnceLock::new();
+        EYE_HEIGHTS
+            .get_or_init(|| {
+                std::fs::read(self.options.resources.join("entity-types.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .and_then(|v| {
+                        v.as_object().map(|o| {
+                            o.iter()
+                                .filter_map(|(k, t)| {
+                                    Some((k.clone(), f64::from(t["eye_height"].as_f64()? as f32)))
+                                })
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default()
+            })
+            .get(ty)
+            .copied()
+            .unwrap_or(0.0)
     }
     /// EntityAnchorArgument.Anchor.apply.
     pub(super) fn anchor_position(&self, s: &Source) -> [f64; 3] {
@@ -155,14 +203,20 @@ impl Game<'_> {
             _ => s.pos,
         }
     }
-    /// Evaluate `f` with `source` as the command source.
+    /// Evaluate `f` with `source` as the command source, in the source's
+    /// level (`CommandSourceStack.getLevel`): a server puts that level in
+    /// place for it.
     pub(in crate::game) fn with_source<T>(
         &mut self,
         source: Source,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let previous = self.command_source.replace(source);
+        let back = self.enter_command_level(source.dimension);
         let out = f(self);
+        if let Some(back) = back {
+            self.enter_command_level(back);
+        }
         self.command_source = previous;
         out
     }
@@ -172,7 +226,7 @@ impl Game<'_> {
     /// Run one command line with `source` (no error reporting): the entry
     /// for functions and `execute run`.
     pub(in crate::game) fn execute_line(&mut self, line: &str, source: Source) -> R<i32> {
-        let d = vanilla::game_dispatcher();
+        let d = vanilla::game_dispatcher_with_features(&self.level.enabled_features);
         let parse = d.parse(line, &self.ui.registries);
         let (ctx, _) = parse.executable()?;
         let ctx = ctx.clone();
@@ -264,6 +318,8 @@ impl Game<'_> {
 
     /// ExecuteCommand: `ctx` is the context holding the `execute` literal.
     pub(in crate::game) fn run_execute(&mut self, ctx: &Context) -> R<i32> {
+        // BuildContexts: a modifier may not bring the sources to this many.
+        let fork_limit = self.ui.rules.int("max_command_forks") as usize;
         let mut sources = vec![self.command_source.unwrap_or_else(|| self.player_source())];
         let mut c = ctx;
         // A fork modifier (as, at, positioned as, rotated as, facing entity,
@@ -315,6 +371,9 @@ impl Game<'_> {
                     let mut kept = Vec::new();
                     for s in sources {
                         let (keep, _) = self.with_source(s, |g| g.condition(c, want))?;
+                        if kept.len() + usize::from(keep) >= fork_limit {
+                            return fork_limit_reached(forked, fork_limit);
+                        }
                         if keep {
                             kept.push(s);
                         }
@@ -330,7 +389,11 @@ impl Game<'_> {
                     };
                     let mut next = Vec::new();
                     for s in sources {
-                        next.extend(self.with_source(s, |g| g.modify(word, c, s))?);
+                        let new = self.with_source(s, |g| g.modify(word, c, s))?;
+                        if next.len() + new.len() >= fork_limit {
+                            return fork_limit_reached(forked, fork_limit);
+                        }
+                        next.extend(new);
                     }
                     sources = next;
                 }
@@ -447,11 +510,13 @@ impl Game<'_> {
             "at" => targets(self)?
                 .into_iter()
                 .filter_map(|t| {
+                    // CommandSourceStack.withLevel(entity.level()).
+                    let level = self.target_level(t);
                     Some(Source {
                         pos: self.target_position(t)?,
                         rot: self.target_rotation(t),
-                        dimension: self.dim,
-                        level: None,
+                        dimension: level,
+                        level: (level != self.dim).then_some(level),
                         ..s
                     })
                 })
@@ -459,9 +524,10 @@ impl Game<'_> {
             "positioned" if c.has("as") => targets(self)?
                 .into_iter()
                 .filter_map(|t| {
+                    // withPosition keeps the anchor (only `positioned <pos>`
+                    // resets it to the feet).
                     Some(Source {
                         pos: self.target_position(t)?,
-                        eyes: false,
                         ..s
                     })
                 })
@@ -588,20 +654,97 @@ impl Game<'_> {
         };
         let found: Vec<Target> = match c.literals.last().map(String::as_str) {
             Some("owner") => match entity {
+                // OwnableEntity.getOwner → EntityReference.getLivingEntity:
+                // a marker or a display with that UUID is not an owner.
                 Target::Mob(id) => self
                     .mobs
                     .iter()
                     .find(|m| m.id == id)
                     .and_then(|m| m.extra.owner)
                     .and_then(|u| self.target_with_uuid(u))
+                    .filter(|owner| {
+                        matches!(
+                            owner,
+                            Target::Player
+                                | Target::Guest(_)
+                                | Target::Mob(_)
+                                | Target::Stand(_)
+                                | Target::Dragon(_)
+                        )
+                    })
                     .into_iter()
                     .collect(),
                 _ => Vec::new(),
             },
-            Some("vehicle") => match entity {
-                Target::Player => self.riding.map(Target::Mob).into_iter().collect(),
+            // Leashable.getLeashHolder: a fence knot is not an entity here.
+            Some("leasher") => match entity {
+                Target::Mob(id) => self
+                    .mobs
+                    .iter()
+                    .find(|m| m.id == id)
+                    .and_then(|m| m.extra.leash.map(|holder| (holder, m.extra.leash_player)))
+                    .and_then(|(holder, player)| match holder {
+                        // The player who tied it (the host's when unrecorded).
+                        horizon_client::mobs::leash::Holder::Player => {
+                            let uuid = player.or(self.level.player_uuid)?;
+                            self.target_by_uuid(horizon_client::lan::playerdata::ints_uuid(uuid))
+                        }
+                        horizon_client::mobs::leash::Holder::Mob(i) => Some(Target::Mob(i)),
+                        horizon_client::mobs::leash::Holder::Boat(_)
+                        | horizon_client::mobs::leash::Holder::Knot(_) => None,
+                    })
+                    .into_iter()
+                    .collect(),
                 _ => Vec::new(),
             },
+            // TraceableEntity.getOwner: who shot a projectile, who threw an
+            // item, who summoned a vex.
+            Some("origin") => match entity {
+                Target::Projectile(id) => self
+                    .creatures
+                    .projectiles
+                    .iter()
+                    .find(|p| p.id == id)
+                    .and_then(|p| match (p.owner?, p.guest) {
+                        // A guest's shot: `Who::Player` is them.
+                        (horizon_client::mobs::Who::Player, Some(conn))
+                            if self.lan_acting == Some(conn) =>
+                        {
+                            Some(Target::Player)
+                        }
+                        (horizon_client::mobs::Who::Player, Some(conn)) => {
+                            Some(Target::Guest(conn))
+                        }
+                        (horizon_client::mobs::Who::Player, None) => Some(Target::Player),
+                        (horizon_client::mobs::Who::Mob(id), _) => Some(Target::Mob(id)),
+                    })
+                    .into_iter()
+                    .collect(),
+                Target::Item(id) => self
+                    .dropped
+                    .iter()
+                    .find(|d| d.id == id)
+                    .and_then(|d| d.thrower)
+                    .and_then(|words| {
+                        let uuid = words
+                            .iter()
+                            .fold(0u128, |all, w| all << 32 | u128::from(*w as u32));
+                        self.target_by_uuid(uuid)
+                    })
+                    .into_iter()
+                    .collect(),
+                Target::Mob(id) => self
+                    .mobs
+                    .iter()
+                    .find(|m| m.id == id && m.kind.id == "minecraft:vex")
+                    .map(|m| m.extra.counter2 as u32)
+                    .filter(|owner| *owner != 0)
+                    .map(Target::Mob)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            },
+            Some("vehicle") => self.ride_vehicle(entity).into_iter().collect(),
             Some("controller") | Some("passengers") => match entity {
                 Target::Mob(id) if self.mobs.iter().any(|m| m.id == id && m.rider.is_some()) => {
                     vec![Target::Player]
@@ -623,7 +766,18 @@ impl Game<'_> {
                             }
                         })
                         .map(|w| match w {
-                            horizon_client::mobs::Who::Player => Target::Player,
+                            horizon_client::mobs::Who::Player => {
+                                // LivingEntity.getLastHurtByMob is the player
+                                // who hit it, not whichever client is reading it.
+                                match self.last_hurt_by_player.get(&id) {
+                                    Some(Some(conn))
+                                        if attacker && self.lan_acting != Some(*conn) =>
+                                    {
+                                        Target::Guest(*conn)
+                                    }
+                                    _ => Target::Player,
+                                }
+                            }
                             horizon_client::mobs::Who::Mob(i) => Target::Mob(i),
                         })
                         .into_iter()
@@ -642,25 +796,25 @@ impl Game<'_> {
             })
             .collect()
     }
-    pub(super) fn target_with_uuid(&self, uuid: [i32; 4]) -> Option<Target> {
+    /// `ServerLevel.getEntity(UUID)`: any entity of the level in place, not
+    /// only mobs (displays, armor stands, items...). The map is keyed by id,
+    /// so a killed entity and a later summon of the same UUID can both be
+    /// in it; the one the level still holds is the entity.
+    pub(in crate::game) fn target_with_uuid(&self, uuid: [i32; 4]) -> Option<Target> {
         if Some(uuid) == self.level.player_uuid {
             return Some(Target::Player);
         }
-        let id = self
-            .persist
-            .uuids
-            .iter()
-            .find(|(_, u)| **u == uuid)
-            .map(|(id, _)| *id)?;
-        self.mobs
-            .iter()
-            .any(|m| m.id == id)
-            .then_some(Target::Mob(id))
+        self.persist.uuids.iter().find_map(|(&id, found)| {
+            if *found != uuid {
+                return None;
+            }
+            self.level_entity(i32::try_from(id).ok()?)
+        })
     }
     /// The highest block of a heightmap type at a column (`Level.getHeight`).
     fn heightmap_at(&self, kind: &str, x: i32, z: i32) -> i32 {
-        let top = horizon_client::chunk::MIN_Y + horizon_client::chunk::HEIGHT;
-        for y in (horizon_client::chunk::MIN_Y..top).rev() {
+        let top = self.world.top_y();
+        for y in (self.world.bottom_y()..top).rev() {
             let state = self.world.block(x, y, z);
             if state == self.world.air {
                 continue;
@@ -683,7 +837,7 @@ impl Game<'_> {
                 return y + 1;
             }
         }
-        horizon_client::chunk::MIN_Y
+        self.world.bottom_y()
     }
     /// A `store` modifier: a new callback in the source's chain.
     fn store_source(&mut self, c: &Context, s: Source) -> R<Source> {
@@ -802,10 +956,12 @@ impl Game<'_> {
                 .coords(c, "pos")
                 .map(|co| co.block(self.source_position(), self.source_rotation()));
             let dimension = self.command_source.map_or(self.dim, |s| s.dimension);
-            return Ok(flag(
-                dimension == self.dim
-                    && p.is_some_and(|p| self.world.chunks.contains_key(&(p[0] >> 4, p[2] >> 4))),
-            ));
+            // ExecuteCommand.isChunkLoaded: ENTITY_TICKING, which is past lit.
+            let loaded = |p: [i32; 3]| {
+                let key = (p[0] >> 4, p[2] >> 4);
+                self.world.chunks.contains_key(&key) && self.streaming.is_lit(key.0, key.1)
+            };
+            return Ok(flag(dimension == self.dim && p.is_some_and(loaded)));
         }
         if c.has("dimension") {
             let dimension = self.command_source.map_or(self.dim, |s| s.dimension);
@@ -957,9 +1113,11 @@ impl Game<'_> {
     /// The biome name at a block position.
     fn biome_name_at_block(&self, p: [i32; 3]) -> Option<String> {
         let chunk = self.world.chunks.get(&(p[0] >> 4, p[2] >> 4))?;
+        // The world's table (`world_biomes!`): a packed biome's id is past
+        // the built-in list, and `Biomes::get` would clamp it to the last
+        // vanilla one.
         Some(
-            self.res
-                .biomes()
+            world_biomes!(self)
                 .get(chunk.biome(p[0], p[1], p[2]))
                 .name
                 .clone(),
@@ -968,30 +1126,16 @@ impl Game<'_> {
     /// A biome id or `#tag` matched against a biome name.
     pub(super) fn biome_matches(&self, wanted: &str, biome: &str) -> bool {
         match wanted.strip_prefix('#') {
-            Some(tag) => self.biome_tag_has(tag, biome, 0),
+            Some(tag) => self.biome_tag_has(tag, biome),
             None => wanted == biome,
         }
     }
-    fn biome_tag_has(&self, tag: &str, biome: &str, depth: u32) -> bool {
-        if depth > 8 {
-            return false;
-        }
-        let (ns, path) = tag.split_once(':').unwrap_or(("minecraft", tag));
-        let file = self
-            .options
-            .resources
-            .join(format!("data/{ns}/tags/worldgen/biome/{path}.json"));
-        let Ok(bytes) = std::fs::read(file) else {
-            return self.res.mob_data().biome_has(tag, biome);
-        };
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        v["values"].as_array().is_some_and(|a| {
-            a.iter()
-                .filter_map(|e| e.as_str())
-                .any(|e| match e.strip_prefix('#') {
-                    Some(inner) => self.biome_tag_has(inner, biome, depth + 1),
-                    None => e == biome,
-                })
-        })
+    /// `#tag`: the biome tags the game's files and the world's packs define,
+    /// nested tags expanded; an unknown tag falls back to the game's built-in
+    /// table.
+    fn biome_tag_has(&self, tag: &str, biome: &str) -> bool {
+        let entries = self.tag_entries("worldgen/biome", tag);
+        entries.iter().any(|id| id == biome)
+            || (entries.is_empty() && self.res.mob_data().biome_has(tag, biome))
     }
 }

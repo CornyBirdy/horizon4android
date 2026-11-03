@@ -3,7 +3,7 @@
 //! unfold, a rotation, split screen), and creates a new one, of whatever size, when it comes back.
 //! The renderer keeps its device, pipelines and textures through that; only the swapchain goes.
 use super::Game;
-use winit::event_loop::ActiveEventLoop;
+use super::event_loop::EventLoopCtl;
 
 impl Game<'_> {
     /// `ApplicationHandler::suspended`: the native window is about to be destroyed, so the surface
@@ -37,7 +37,7 @@ impl Game<'_> {
 
     /// `ApplicationHandler::resumed` with the window already made: a new surface of the window's
     /// size now.
-    pub(super) fn surface_back(&mut self, event_loop: &ActiveEventLoop) {
+    pub(super) fn surface_back(&mut self, event_loop: &dyn EventLoopCtl) {
         let Some(window) = self.window.clone() else {
             return;
         };

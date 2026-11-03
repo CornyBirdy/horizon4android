@@ -21,7 +21,6 @@ pub mod start_checks;
 pub mod stronghold;
 pub mod template;
 pub mod temple;
-pub mod yung;
 
 use crate::{
     nbt::{self, Limits},
@@ -35,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
-pub use template::{BlockInfo, JigsawInfo, StructureTemplate};
+pub use template::{BlockInfo, EntityInfo, JigsawInfo, StructureTemplate, save_nbt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rotation {
@@ -77,8 +76,26 @@ impl Rotation {
         let index = order.iter().position(|d| *d == direction).unwrap();
         order[(index + self as usize) % 4]
     }
+    /// `Rotation.getSerializedName`: the value of `Rotation.CODEC`.
+    pub fn serialized_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Clockwise90 => "clockwise_90",
+            Self::Clockwise180 => "180",
+            Self::Counterclockwise90 => "counterclockwise_90",
+        }
+    }
     pub fn get_rotated(self, other: Self) -> Self {
         Self::ALL[(self as usize + other as usize) % 4]
+    }
+    /// `Rotation.name()`, as structure pieces save it.
+    pub fn saved_name(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Clockwise90 => "CLOCKWISE_90",
+            Self::Clockwise180 => "CLOCKWISE_180",
+            Self::Counterclockwise90 => "COUNTERCLOCKWISE_90",
+        }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -86,6 +103,16 @@ pub enum Mirror {
     None,
     LeftRight,
     FrontBack,
+}
+impl Mirror {
+    /// `Mirror.name()`, as structure pieces save it.
+    pub fn saved_name(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::LeftRight => "LEFT_RIGHT",
+            Self::FrontBack => "FRONT_BACK",
+        }
+    }
 }
 
 /// Inclusive integer box (vanilla BoundingBox).
@@ -341,20 +368,24 @@ impl StructureResources {
         }
         let (namespace, path) = id.split_once(':').unwrap();
         let file = self.dir.join(namespace).join(format!("{path}.nbt"));
-        let loaded = std::fs::read(&file).ok().and_then(|bytes| {
-            let mut raw = Vec::new();
-            flate2::read::GzDecoder::new(bytes.as_slice())
-                .read_to_end(&mut raw)
-                .ok()?;
-            let tag = nbt::read_named(&raw, Limits::templates()).ok()?.0.tag;
-            Some(Arc::new(StructureTemplate::from_nbt(
-                &tag,
-                self.registry,
-                &self.transforms,
-            )))
-        });
+        let loaded = horizon_core::prepared_files::read(&file)
+            .ok()
+            .and_then(|bytes| {
+                let mut raw = Vec::new();
+                flate2::read::GzDecoder::new(bytes.as_slice())
+                    .read_to_end(&mut raw)
+                    .ok()?;
+                let tag = nbt::read_named(&raw, Limits::templates()).ok()?.0.tag;
+                Some(StructureTemplate::from_nbt(
+                    &tag,
+                    self.registry,
+                    &self.transforms,
+                ))
+            });
         // StructureTemplateManager.getOrCreate: missing templates are empty.
-        let loaded = loaded.or_else(|| Some(Arc::new(StructureTemplate::empty())));
+        let mut loaded = loaded.unwrap_or_else(StructureTemplate::empty);
+        loaded.location = id.as_str().into();
+        let loaded = Some(Arc::new(loaded));
         self.templates.write().unwrap().insert(id, loaded.clone());
         loaded
     }

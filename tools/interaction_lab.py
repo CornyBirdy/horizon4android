@@ -12,7 +12,7 @@ except ImportError:
     import lab
     import test_rust_parity as base
 
-RESOURCES = lab.LOCAL / 'horizon-client' / '26.3'
+RESOURCES = lab.RESOURCES
 PARITY = lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity'
 
 
@@ -50,7 +50,10 @@ def cargo_example(package, example, *args, profile=None):
     command = ['cargo', 'run', '-q', '-j3']
     if profile:
         command += ['--profile', profile]
-    command += ['-p', package, '--example', example, '--', *map(str, args)]
+    probe = package.removeprefix('horizon-') + '_probe'  # each crate's probe example: client_probe, world_probe
+    if package == 'horizon-client':
+        package = 'horizon-client-lib'
+    command += ['-p', package, '--example', probe, '--', example, *map(str, args)]
     subprocess.run(command, check=True, cwd=lab.ROOT)
 
 

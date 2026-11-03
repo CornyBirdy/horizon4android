@@ -26,7 +26,7 @@ def size(png):
 
 
 def make_input(build):
-    root = oh.lab.LOCAL / 'horizon-client' / '26.3'
+    root = oh.lab.RESOURCES
     textures = root / 'assets/minecraft/textures'
     names = []
     for folder, every in (('block', 1), ('item', 7)):
@@ -50,5 +50,5 @@ if __name__ == '__main__':
                     'MipmapGenerator.generateMipLevels (solidify, fillEmptyAreasWithDarkColor, meanLinear, '
                     'darkenedAlphaBlend, alphaTestCoverage, scaleAlphaToCoverage) on static 16x16 block and item sprites '
                     'with their .mcmeta texture settings',
-                    sources=[oh.lab.ROOT / 'crates/horizon-client/src/mipmap.rs',
-                             oh.lab.ROOT / 'crates/horizon-client/src/sprites.rs'])
+                    sources=[oh.lab.ROOT / 'crates/horizon-client-render/src/mipmap.rs',
+                             oh.lab.ROOT / 'crates/horizon-client-render/src/sprites.rs'])

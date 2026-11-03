@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{
     heightmap::HeightmapType,
+    nbt::{Compound, Tag},
     worldgen::{
         DecodeError,
         block_feature::FeatureBlockBindings,
@@ -30,18 +31,27 @@ pub enum Projection {
     Rigid,
     TerrainMatching,
 }
+impl Projection {
+    /// `StructureTemplatePool.Projection.getSerializedName`.
+    pub fn saved_name(self) -> &'static str {
+        match self {
+            Self::Rigid => "rigid",
+            Self::TerrainMatching => "terrain_matching",
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub enum PoolElement {
     Empty,
     Single {
         template: Arc<StructureTemplate>,
         processors: ProcessorList,
+        /// The element's `processors` as written: a list id or an inline list,
+        /// saved back as it was.
+        processors_source: Value,
         legacy: bool,
         projection: Projection,
         waterlogging: Option<bool>,
-        /// YUNG's API's rules on the piece (`"horizon:yungsapi"`), read only
-        /// by its assembler ([`super::yung`]).
-        yung: Option<Box<super::yung::Rules>>,
         /// The piece's own terrain kernel in a structure that has one
         /// (`"horizon:enhanced_terrain_adaptation"`).
         enhanced_terrain: Option<Arc<super::enhanced_terrain::Adaptation>>,
@@ -122,7 +132,16 @@ impl PoolElement {
         };
         Ok(match kind {
             "minecraft:empty_pool_element" => Self::Empty,
-            "minecraft:single_pool_element" | "minecraft:legacy_single_pool_element" => {
+            // Lithostitched's elements place what their `delegate` places;
+            // their limits are the pool entry's (`Pool::limits`).
+            "lithostitched:limited" | "lithostitched:guaranteed" | "lithostitched:delegating" => {
+                Self::decode(&value["delegate"], resources, bindings, inherited)?
+            }
+            // YUNG's API's element places what a single element places; its
+            // own fields are the pool entry's rules (`Pool::rules`).
+            "minecraft:single_pool_element"
+            | "minecraft:legacy_single_pool_element"
+            | "yungsapi:yung_single_element" => {
                 let location = value["location"]
                     .as_str()
                     .ok_or(DecodeError::Field("location"))?;
@@ -135,6 +154,7 @@ impl PoolElement {
                         resources,
                         bindings,
                     )?,
+                    processors_source: value["processors"].clone(),
                     legacy: kind == "minecraft:legacy_single_pool_element",
                     projection: projection()?,
                     waterlogging: match value
@@ -145,10 +165,6 @@ impl PoolElement {
                         Some("ignore_waterlogging") => Some(false),
                         _ => None,
                     },
-                    yung: value
-                        .get("horizon:yungsapi")
-                        .map(|rules| super::yung::Rules::decode(rules, resources).map(Box::new))
-                        .transpose()?,
                     enhanced_terrain: value
                         .get("horizon:enhanced_terrain_adaptation")
                         .map(|a| super::enhanced_terrain::Adaptation::decode(a).map(Arc::new))
@@ -180,6 +196,64 @@ impl PoolElement {
             }
             _ => return Err(DecodeError::Field("pool element type")),
         })
+    }
+    /// `StructurePoolElement.CODEC`'s encoding, as a jigsaw piece saves it.
+    pub fn save(&self) -> Tag {
+        let text = |s: &str| Tag::String(s.into());
+        match self {
+            Self::Empty => Tag::compound([("element_type", text("minecraft:empty_pool_element"))]),
+            Self::Single {
+                template,
+                processors_source,
+                legacy,
+                projection,
+                waterlogging,
+                ..
+            } => {
+                let kind = if *legacy {
+                    "minecraft:legacy_single_pool_element"
+                } else {
+                    "minecraft:single_pool_element"
+                };
+                let mut entries = vec![
+                    ("element_type", text(kind)),
+                    ("location", text(&template.location)),
+                    (
+                        "processors",
+                        super::processor::json_to_nbt(processors_source),
+                    ),
+                    ("projection", text(projection.saved_name())),
+                ];
+                if let Some(apply) = waterlogging {
+                    let settings = if *apply {
+                        "apply_waterlogging"
+                    } else {
+                        "ignore_waterlogging"
+                    };
+                    entries.push(("override_liquid_settings", text(settings)));
+                }
+                Tag::compound(entries)
+            }
+            Self::Feature {
+                feature,
+                projection,
+            } => Tag::compound([
+                ("element_type", text("minecraft:feature_pool_element")),
+                ("feature", text(feature)),
+                ("projection", text(projection.saved_name())),
+            ]),
+            Self::List {
+                elements,
+                projection,
+            } => Tag::compound([
+                ("element_type", text("minecraft:list_pool_element")),
+                (
+                    "elements",
+                    Tag::List(elements.iter().map(Self::save).collect()),
+                ),
+                ("projection", text(projection.saved_name())),
+            ]),
+        }
     }
     pub fn projection(&self) -> Projection {
         match self {
@@ -244,13 +318,10 @@ impl PoolElement {
                 .first()
                 .map(|e| e.shuffled_jigsaws(resources, position, rotation, random))
                 .unwrap_or_default(),
-            Self::Single { template, yung, .. } => {
+            Self::Single { template, .. } => {
                 let mut jigsaws = template_jigsaws(resources, template, position, rotation);
                 shuffle(&mut jigsaws, random);
-                // YUNG's elements keep the shuffled order.
-                if yung.is_none() {
-                    jigsaws.sort_by_key(|j| std::cmp::Reverse(j.selection_priority));
-                }
+                jigsaws.sort_by_key(|j| std::cmp::Reverse(j.selection_priority));
                 jigsaws
             }
         }
@@ -259,13 +330,6 @@ impl PoolElement {
         match self {
             Self::Single { ground_level, .. } => *ground_level,
             _ => 1,
-        }
-    }
-    /// YUNG's API's rules, on a piece of one of its structures.
-    pub fn yung(&self) -> Option<&super::yung::Rules> {
-        match self {
-            Self::Single { yung, .. } => yung.as_deref(),
-            _ => None,
         }
     }
     /// The piece's own terrain kernel, in place of its structure's.
@@ -334,8 +398,17 @@ pub(super) fn can_attach(source: &Jigsaw, target: &Jigsaw) -> bool {
 pub struct Pool {
     /// Each element repeated by its weight.
     pub(super) templates: Vec<Arc<PoolElement>>,
+    /// The entry of `raw` each of `templates` repeats.
+    entries: Vec<usize>,
     /// The elements with their weights, in file order (`rawTemplates`).
     pub(super) raw: Vec<(Arc<PoolElement>, i32)>,
+    /// Per entry of `raw`: a YUNG element's rules.
+    rules: Vec<Rules>,
+    /// Per entry of `raw`: a Lithostitched `limited` or `guaranteed`
+    /// element's limit.
+    limits: Vec<Option<Limit>>,
+    /// The entries of `raw` that are Lithostitched's `guaranteed` elements.
+    guaranteed: Vec<usize>,
     pub(super) fallback: String,
     max_size: OnceLock<i32>,
 }
@@ -349,10 +422,21 @@ impl Pool {
             .unwrap_or(0) as usize]
             .clone()
     }
-    fn shuffled(&self, random: &mut impl RandomSource) -> Vec<Arc<PoolElement>> {
-        let mut copy = self.templates.clone();
-        shuffle(&mut copy, random);
-        copy
+    /// The entries of `templates`, shuffled.
+    fn shuffled(&self, random: &mut impl RandomSource) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.templates.len()).collect();
+        shuffle(&mut order, random);
+        order.into_iter().map(|i| self.entries[i]).collect()
+    }
+    /// YUNG's API's pick: `nextInt` of the entries' total weight, walked in
+    /// `order` (indices into `raw`); the entry that takes it below zero.
+    fn weighted(&self, order: &[usize], random: &mut impl RandomSource) -> Option<usize> {
+        let total: i32 = order.iter().map(|&i| self.raw[i].1).sum();
+        let mut pick = random.next_int_bound(total).ok()?;
+        order.iter().position(|&i| {
+            pick -= self.raw[i].1;
+            pick < 0
+        })
     }
     pub(super) fn max_size(&self) -> i32 {
         *self.max_size.get_or_init(|| {
@@ -363,6 +447,74 @@ impl Pool {
                 .max()
                 .unwrap_or(0)
         })
+    }
+}
+/// A `yungsapi:yung_single_element`'s own fields (spec-yungsapi §3, §3.2).
+#[derive(Clone, Debug, Default)]
+struct Rules {
+    /// `name` and `max_count`: the most pieces of that name in one start,
+    /// the start not counted.
+    limit: Option<(Arc<str>, i32)>,
+    /// `is_priority`: tried before the pool's other entries, in the
+    /// shuffled order and without a weighted draw.
+    priority: bool,
+    /// `min_required_depth`: the least depth of the parent piece (the start
+    /// is depth 0).
+    min_depth: i32,
+    /// `ignore_bounds`: placed without the free-space test.
+    ignore_bounds: bool,
+}
+impl Rules {
+    fn of(element: &Value) -> Self {
+        if element["element_type"] != "yungsapi:yung_single_element" {
+            return Self::default();
+        }
+        Self {
+            limit: element["name"]
+                .as_str()
+                .zip(element["max_count"].as_i64())
+                .map(|(name, max)| (name.into(), max as i32)),
+            priority: element["is_priority"].as_bool().unwrap_or(false),
+            min_depth: element["min_required_depth"].as_i64().unwrap_or(0) as i32,
+            ignore_bounds: element["ignore_bounds"].as_bool().unwrap_or(false),
+        }
+    }
+}
+/// How many pieces of a Lithostitched `limited` or `guaranteed` element one
+/// start may hold, and where (spec-lithostitched §3).
+#[derive(Clone, Debug)]
+struct Limit {
+    /// The pieces counted together: the element itself (its JSON), wherever
+    /// it is listed.
+    key: Arc<str>,
+    max: i32,
+    /// The parent piece's least depth (the start is at 0).
+    min_depth: i32,
+    /// `lithostitched:guaranteed`: tried before its pool's other entries.
+    guaranteed: bool,
+}
+impl Limit {
+    fn of(element: &Value) -> Option<Self> {
+        let int = |key: &str| {
+            element[key]
+                .as_i64()
+                .map(|v| v.clamp(0, i32::MAX.into()) as i32)
+        };
+        let (max, guaranteed) = match element["element_type"].as_str()? {
+            "lithostitched:limited" => (int("limit")?, false),
+            "lithostitched:guaranteed" => (int("count").unwrap_or(1), true),
+            _ => return None,
+        };
+        Some(Self {
+            key: element.to_string().into(),
+            max,
+            min_depth: int("min_depth").unwrap_or(0),
+            guaranteed,
+        })
+    }
+    /// Whether one more piece may go below a parent at `depth`.
+    fn allows(&self, counts: &HashMap<Arc<str>, i32>, depth: i32) -> bool {
+        depth >= self.min_depth && counts.get(&self.key).copied().unwrap_or(0) < self.max
     }
 }
 /// Lazily decoded template pools.
@@ -393,7 +545,8 @@ impl Pools {
         }
         let pool = self.raw.get(name).and_then(|json| {
             let value: Value = serde_json::from_str(json).ok()?;
-            let (mut templates, mut raw) = (Vec::new(), Vec::new());
+            let (mut templates, mut entries, mut raw, mut rules, mut limits) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for entry in value["elements"].as_array()? {
                 let element =
                     match PoolElement::decode(&entry["element"], resources, bindings, None) {
@@ -408,12 +561,23 @@ impl Pools {
                 let weight = entry["weight"].as_i64().unwrap_or(1);
                 for _ in 0..weight {
                     templates.push(element.clone());
+                    entries.push(raw.len());
                 }
                 raw.push((element, weight as i32));
+                rules.push(Rules::of(&entry["element"]));
+                limits.push(Limit::of(&entry["element"]));
             }
+            let guaranteed = (limits.iter().enumerate())
+                .filter(|(_, l)| l.as_ref().is_some_and(|l| l.guaranteed))
+                .map(|(i, _)| i)
+                .collect();
             Some(Arc::new(Pool {
                 templates,
+                entries,
                 raw,
+                rules,
+                limits,
+                guaranteed,
                 fallback: value["fallback"]
                     .as_str()
                     .unwrap_or("minecraft:empty")
@@ -434,6 +598,9 @@ pub struct Junction {
     pub source_x: i32,
     pub source_ground_y: i32,
     pub source_z: i32,
+    /// Saved only (`JigsawJunction.deltaY`, `destProjection`).
+    pub delta_y: i32,
+    pub dest_projection: Projection,
 }
 #[derive(Debug)]
 pub struct PoolPiece {
@@ -446,6 +613,108 @@ pub struct PoolPiece {
     pub waterlogging: bool,
 }
 impl PoolPiece {
+    /// A piece as a saved start lists it (PoolElementStructurePiece's tag:
+    /// `pool_element`, `PosX`/`PosY`/`PosZ`, `rotation`, `ground_level_delta`,
+    /// `BB`, `junctions`, `liquid_settings`), in JSON. Harnesses place another
+    /// game's layout with it.
+    pub fn from_saved(
+        v: &Value,
+        resources: &StructureResources,
+        bindings: &FeatureBlockBindings<'_>,
+    ) -> Result<Self, DecodeError> {
+        let int = |v: &Value, key: &'static str| {
+            v[key]
+                .as_i64()
+                .and_then(|i| i32::try_from(i).ok())
+                .ok_or(DecodeError::Field(key))
+        };
+        let corners: Vec<i32> = v["BB"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i32::try_from(i.as_i64()?).ok())
+            .collect();
+        let [x0, y0, z0, x1, y1, z1]: [i32; 6] =
+            corners.try_into().map_err(|_| DecodeError::Field("BB"))?;
+        let rotation = match v["rotation"].as_str() {
+            Some("NONE") => Rotation::None,
+            Some("CLOCKWISE_90") => Rotation::Clockwise90,
+            Some("CLOCKWISE_180") => Rotation::Clockwise180,
+            Some("COUNTERCLOCKWISE_90") => Rotation::Counterclockwise90,
+            _ => return Err(DecodeError::Field("rotation")),
+        };
+        let junctions = v["junctions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|j| {
+                Ok(Junction {
+                    source_x: int(j, "source_x")?,
+                    source_ground_y: int(j, "source_ground_y")?,
+                    source_z: int(j, "source_z")?,
+                    delta_y: int(j, "delta_y")?,
+                    dest_projection: match j["dest_proj"].as_str() {
+                        Some("rigid") => Projection::Rigid,
+                        Some("terrain_matching") => Projection::TerrainMatching,
+                        _ => return Err(DecodeError::Field("dest_proj")),
+                    },
+                })
+            })
+            .collect::<Result<_, DecodeError>>()?;
+        Ok(Self {
+            element: Arc::new(PoolElement::decode(
+                &v["pool_element"],
+                resources,
+                bindings,
+                None,
+            )?),
+            position: [int(v, "PosX")?, int(v, "PosY")?, int(v, "PosZ")?],
+            ground_level_delta: int(v, "ground_level_delta")?,
+            rotation,
+            bounding_box: BoundingBox::new([x0, y0, z0], [x1, y1, z1]),
+            junctions,
+            waterlogging: v["liquid_settings"].as_str() != Some("ignore_waterlogging"),
+        })
+    }
+    /// `PoolElementStructurePiece`'s tag (always genDepth 0, no orientation).
+    pub fn save(&self) -> Compound {
+        let mut tag = super::legacy::piece_tag("minecraft:jigsaw", self.bounding_box, None, 0);
+        let junctions = self
+            .junctions
+            .iter()
+            .map(|j| {
+                Tag::compound([
+                    ("source_x", Tag::Int(j.source_x)),
+                    ("source_ground_y", Tag::Int(j.source_ground_y)),
+                    ("source_z", Tag::Int(j.source_z)),
+                    ("delta_y", Tag::Int(j.delta_y)),
+                    (
+                        "dest_proj",
+                        Tag::String(j.dest_projection.saved_name().into()),
+                    ),
+                ])
+            })
+            .collect();
+        for (key, value) in [
+            ("PosX", Tag::Int(self.position[0])),
+            ("PosY", Tag::Int(self.position[1])),
+            ("PosZ", Tag::Int(self.position[2])),
+            ("ground_level_delta", Tag::Int(self.ground_level_delta)),
+            ("pool_element", self.element.save()),
+            ("rotation", Tag::String(self.rotation.saved_name().into())),
+            ("junctions", Tag::List(junctions)),
+        ] {
+            tag.insert(key.into(), value);
+        }
+        // LiquidSettings.APPLY_WATERLOGGING, the default, is not written.
+        if !self.waterlogging {
+            tag.insert(
+                "liquid_settings".into(),
+                Tag::String("ignore_waterlogging".into()),
+            );
+        }
+        tag
+    }
     pub(super) fn moved(&mut self, dy: i32) {
         self.position[1] += dy;
         self.bounding_box = self.bounding_box.moved([0, dy, 0]);
@@ -459,6 +728,7 @@ impl PoolPiece {
         random: &mut R,
         chunk_box: BoundingBox,
         reference: [i32; 3],
+        keep_jigsaws: bool,
         place_feature: &mut PlaceFeature<'_, W, R>,
     ) -> Result<bool, PlacementQueryError> {
         place_element(
@@ -471,6 +741,7 @@ impl PoolPiece {
             reference,
             self.rotation,
             self.waterlogging,
+            keep_jigsaws,
             place_feature,
         )
     }
@@ -489,6 +760,7 @@ fn place_element<W: FeatureWorld + PlacementContext, R: RandomSource>(
     reference: [i32; 3],
     rotation: Rotation,
     waterlogging: bool,
+    keep_jigsaws: bool,
     place_feature: &mut PlaceFeature<'_, W, R>,
 ) -> Result<bool, PlacementQueryError> {
     match element {
@@ -506,6 +778,7 @@ fn place_element<W: FeatureWorld + PlacementContext, R: RandomSource>(
                     reference,
                     rotation,
                     waterlogging,
+                    keep_jigsaws,
                     place_feature,
                 )? {
                     return Ok(false);
@@ -545,7 +818,10 @@ fn place_element<W: FeatureWorld + PlacementContext, R: RandomSource>(
             if !*legacy {
                 settings.processors.push(ignore);
             }
-            settings.processors.push(&Processor::JigsawReplacement);
+            // SinglePoolElement.getSettings: keepJigsaws skips the replacement.
+            if !keep_jigsaws {
+                settings.processors.push(&Processor::JigsawReplacement);
+            }
             settings.processors.extend(processors.0.iter());
             if *projection == Projection::TerrainMatching {
                 settings
@@ -587,6 +863,148 @@ pub trait JigsawContext {
     /// couldStructureExistInColumn over inclusive block Y bounds.
     fn column_has_valid_biome(&mut self, x: i32, z: i32, min_y: i32, max_y: i32) -> bool;
 }
+/// How a jigsaw structure draws its pieces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Draws {
+    /// JigsawPlacement's.
+    Vanilla,
+    /// YUNG's API's `yungsapi:yung_jigsaw` (spec-yungsapi §2.1, §3.1, §3.2):
+    /// pools are drawn by weight from their file entries, without
+    /// replacement, priority entries first, and an element at its
+    /// `max_count` or too shallow is skipped.
+    Yung,
+}
+
+/// The elements a jigsaw tries, in order.
+enum Candidates {
+    /// Vanilla: the target pool's weight-expanded entries, then the
+    /// fallback's, each shuffled up front. A pool's Lithostitched
+    /// `guaranteed` entries come first when it is reached, in file order,
+    /// and are not drawn again (spec-lithostitched §3, OPEN-L4).
+    Listed(std::vec::IntoIter<(Arc<Pool>, usize)>),
+    /// YUNG's: picks from each pool in turn (the fallback's only once the
+    /// target's are spent), each pool's entries shuffled when it is
+    /// reached: its priority entries in that order, then weighted picks
+    /// from the others.
+    Weighted {
+        pools: Vec<Arc<Pool>>,
+        current: Option<Drawing>,
+    },
+}
+/// A YUNG pool being drawn: entries (indices into `raw`) not tried yet.
+struct Drawing {
+    pool: Arc<Pool>,
+    priority: VecDeque<usize>,
+    others: Vec<usize>,
+}
+/// An element to try.
+struct Pick {
+    element: Arc<PoolElement>,
+    /// Its YUNG name or Lithostitched limit's key, counted when it is
+    /// placed.
+    name: Option<Arc<str>>,
+    ignore_bounds: bool,
+}
+impl Candidates {
+    fn new(
+        draws: Draws,
+        target: &Arc<Pool>,
+        fallback: &Arc<Pool>,
+        below_max_depth: bool,
+        random: &mut impl RandomSource,
+    ) -> Self {
+        let pools = if below_max_depth {
+            vec![target.clone(), fallback.clone()]
+        } else {
+            vec![fallback.clone()]
+        };
+        match draws {
+            Draws::Vanilla => {
+                let mut listed = Vec::new();
+                for pool in &pools {
+                    listed.extend(pool.guaranteed.iter().map(|&e| (pool.clone(), e)));
+                    let drawn = pool.shuffled(random).into_iter();
+                    let drawn = drawn.filter(|&e| !pool.guaranteed.contains(&e));
+                    listed.extend(drawn.map(|e| (pool.clone(), e)));
+                }
+                Self::Listed(listed.into_iter())
+            }
+            Draws::Yung => Self::Weighted {
+                pools: pools.into_iter().rev().collect(),
+                current: None,
+            },
+        }
+    }
+    /// The next element to try for a jigsaw of a piece at `depth`.
+    fn next(
+        &mut self,
+        counts: &HashMap<Arc<str>, i32>,
+        depth: i32,
+        random: &mut impl RandomSource,
+    ) -> Option<Pick> {
+        match self {
+            Self::Listed(entries) => entries.find_map(|(pool, entry)| {
+                let limit = pool.limits[entry].as_ref();
+                limit.is_none_or(|l| l.allows(counts, depth)).then(|| Pick {
+                    element: pool.raw[entry].0.clone(),
+                    name: limit.map(|l| l.key.clone()),
+                    ignore_bounds: false,
+                })
+            }),
+            Self::Weighted { pools, current } => loop {
+                let drawing = match current {
+                    Some(d) if !d.priority.is_empty() || !d.others.is_empty() => d,
+                    _ => {
+                        let pool = pools.pop()?;
+                        let mut order: Vec<usize> = (0..pool.raw.len()).collect();
+                        shuffle(&mut order, random);
+                        let (priority, others): (Vec<usize>, _) =
+                            order.into_iter().partition(|&i| pool.rules[i].priority);
+                        *current = Some(Drawing {
+                            pool,
+                            priority: priority.into(),
+                            others,
+                        });
+                        continue;
+                    }
+                };
+                let entry = match drawing.priority.pop_front() {
+                    Some(entry) => entry,
+                    None => {
+                        let Some(at) = drawing.pool.weighted(&drawing.others, random) else {
+                            drawing.others.clear();
+                            continue;
+                        };
+                        drawing.others.remove(at)
+                    }
+                };
+                // spec-yungsapi §3.1 item 8: an empty element ends the
+                // jigsaw (the caller's), then `max_count`, then the depth.
+                let rules = &drawing.pool.rules[entry];
+                if let Some((name, max)) = &rules.limit
+                    && counts.get(name).copied().unwrap_or(0) >= *max
+                {
+                    continue;
+                }
+                if depth < rules.min_depth {
+                    continue;
+                }
+                let limit = drawing.pool.limits[entry].as_ref();
+                if limit.is_some_and(|l| !l.allows(counts, depth)) {
+                    continue;
+                }
+                return Some(Pick {
+                    element: drawing.pool.raw[entry].0.clone(),
+                    name: (rules.limit.as_ref().map(|(name, _)| name))
+                        .or(limit.map(|l| &l.key))
+                        .cloned(),
+                    ignore_bounds: rules.ignore_bounds,
+                });
+            },
+        }
+    }
+}
+
 pub struct JigsawConfig<'a> {
     pub start_pool: &'a str,
     pub start_jigsaw: Option<&'a str>,
@@ -629,6 +1047,30 @@ pub fn assemble(
     random: &mut impl RandomSource,
     position: [i32; 3],
 ) -> Option<([i32; 3], Vec<PoolPiece>)> {
+    assemble_drawing(
+        Draws::Vanilla,
+        config,
+        context,
+        pools,
+        resources,
+        bindings,
+        random,
+        position,
+    )
+}
+
+/// [`assemble`] with the given draws.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_drawing(
+    draws: Draws,
+    config: &JigsawConfig<'_>,
+    context: &mut impl JigsawContext,
+    pools: &Pools,
+    resources: &StructureResources,
+    bindings: &FeatureBlockBindings<'_>,
+    random: &mut impl RandomSource,
+    position: [i32; 3],
+) -> Option<([i32; 3], Vec<PoolPiece>)> {
     let alias = |name: &str| {
         config
             .aliases
@@ -636,9 +1078,22 @@ pub fn assemble(
             .cloned()
             .unwrap_or_else(|| name.to_owned())
     };
-    let rotation = Rotation::random(random);
     let center_pool = pools.get(&alias(config.start_pool), resources, bindings)?;
-    let element = center_pool.random_template(random);
+    let (rotation, element) = match draws {
+        Draws::Vanilla => {
+            let rotation = Rotation::random(random);
+            (rotation, center_pool.random_template(random))
+        }
+        // The entries shuffled, then the rotation, then a weighted pick in
+        // the shuffled order.
+        Draws::Yung => {
+            let mut order: Vec<usize> = (0..center_pool.raw.len()).collect();
+            shuffle(&mut order, random);
+            let rotation = Rotation::random(random);
+            let entry = order[center_pool.weighted(&order, random)?];
+            (rotation, center_pool.raw[entry].0.clone())
+        }
+    };
     if matches!(element.as_ref(), PoolElement::Empty) {
         return None;
     }
@@ -690,24 +1145,83 @@ pub fn assemble(
         let [h, v] = config.max_distance;
         let low_y = (cy - v).max(context.min_y() + config.padding[0]);
         let high_y = (cy + v + 1).min(context.max_y() + 1 - config.padding[1]);
-        let free = Rc::new(RefCell::new(Free {
-            container: BoundingBox::new([cx - h, low_y, cz - h], [cx + h, high_y - 1, cz + h]),
-            removed: vec![pieces[0].bounding_box],
-        }));
-        let mut placer = Placer {
+        let container = BoundingBox::new([cx - h, low_y, cz - h], [cx + h, high_y - 1, cz + h]);
+        // The start does not count toward `max_count` (spec-yungsapi §3).
+        add_children_drawing(
+            draws,
+            HashMap::new(),
             config,
+            context,
             pools,
             resources,
             bindings,
-            pieces: &mut pieces,
-            queue: BTreeMap::new(),
-        };
-        placer.children(0, free, 0, context, random);
-        while let Some(state) = placer.next() {
-            placer.children(state.piece, state.free, state.depth, context, random);
-        }
+            random,
+            &mut pieces,
+            container,
+        );
     }
     Some(([cx, cy, cz], pieces))
+}
+
+/// The inner JigsawPlacement.addPieces: lays out the children of
+/// `pieces[0]`, a start piece already placed, to `config.max_depth`,
+/// within `container` (inclusive) less the start's box. A structure with
+/// its own start (Formations' pieced one) reaches the jigsaw layout here.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn add_children(
+    config: &JigsawConfig<'_>,
+    context: &mut impl JigsawContext,
+    pools: &Pools,
+    resources: &StructureResources,
+    bindings: &FeatureBlockBindings<'_>,
+    random: &mut impl RandomSource,
+    pieces: &mut Vec<PoolPiece>,
+    container: BoundingBox,
+) {
+    add_children_drawing(
+        Draws::Vanilla,
+        HashMap::new(),
+        config,
+        context,
+        pools,
+        resources,
+        bindings,
+        random,
+        pieces,
+        container,
+    );
+}
+#[allow(clippy::too_many_arguments)]
+fn add_children_drawing(
+    draws: Draws,
+    counts: HashMap<Arc<str>, i32>,
+    config: &JigsawConfig<'_>,
+    context: &mut impl JigsawContext,
+    pools: &Pools,
+    resources: &StructureResources,
+    bindings: &FeatureBlockBindings<'_>,
+    random: &mut impl RandomSource,
+    pieces: &mut Vec<PoolPiece>,
+    container: BoundingBox,
+) {
+    let free = Rc::new(RefCell::new(Free {
+        container,
+        removed: vec![pieces[0].bounding_box],
+    }));
+    let mut placer = Placer {
+        config,
+        pools,
+        resources,
+        bindings,
+        pieces,
+        queue: BTreeMap::new(),
+        draws,
+        counts,
+    };
+    placer.children(0, free, 0, context, random);
+    while let Some(state) = placer.next() {
+        placer.children(state.piece, state.free, state.depth, context, random);
+    }
 }
 struct Placer<'a, 'p> {
     config: &'a JigsawConfig<'a>,
@@ -717,6 +1231,9 @@ struct Placer<'a, 'p> {
     pieces: &'p mut Vec<PoolPiece>,
     /// SequencedPriorityIterator: highest priority first, FIFO within one.
     queue: BTreeMap<i32, VecDeque<PieceState>>,
+    draws: Draws,
+    /// Pieces placed per limited element (`Limit::key`).
+    counts: HashMap<Arc<str>, i32>,
 }
 impl Placer<'_, '_> {
     fn next(&mut self) -> Option<PieceState> {
@@ -788,12 +1305,19 @@ impl Placer<'_, '_> {
             } else {
                 context_free.clone()
             };
-            let mut targets = Vec::new();
-            if depth != self.config.max_depth {
-                targets.extend(target_pool.shuffled(random));
-            }
-            targets.extend(fallback.shuffled(random));
-            for target in targets {
+            let mut candidates = Candidates::new(
+                self.draws,
+                &target_pool,
+                &fallback,
+                depth != self.config.max_depth,
+                random,
+            );
+            while let Some(Pick {
+                element: target,
+                name,
+                ignore_bounds,
+            }) = candidates.next(&self.counts, depth, random)
+            {
                 if matches!(target.as_ref(), PoolElement::Empty) {
                     break;
                 }
@@ -855,7 +1379,7 @@ impl Placer<'_, '_> {
                             let size = (expand_to + 1).max(target_box.max[1] - target_box.min[1]);
                             target_box.max[1] = target_box.max[1].max(target_box.min[1] + size);
                         }
-                        if !children_free.borrow().fits(&target_box) {
+                        if !ignore_bounds && !children_free.borrow().fits(&target_box) {
                             continue;
                         }
                         children_free.borrow_mut().removed.push(target_box);
@@ -882,6 +1406,8 @@ impl Placer<'_, '_> {
                             source_x: target_pos[0],
                             source_ground_y: junction_y - local_y + source_ground,
                             source_z: target_pos[2],
+                            delta_y,
+                            dest_projection: target.projection(),
                         });
                         self.pieces.push(PoolPiece {
                             element: target.clone(),
@@ -893,9 +1419,18 @@ impl Placer<'_, '_> {
                                 source_x: jigsaw.pos[0],
                                 source_ground_y: junction_y - target_local_y + target_ground,
                                 source_z: jigsaw.pos[2],
+                                delta_y: -delta_y,
+                                dest_projection: if source_rigid {
+                                    Projection::Rigid
+                                } else {
+                                    Projection::TerrainMatching
+                                },
                             }],
                             waterlogging: self.config.waterlogging,
                         });
+                        if let Some(name) = name {
+                            *self.counts.entry(name).or_default() += 1;
+                        }
                         if depth < self.config.max_depth {
                             self.queue
                                 .entry(jigsaw.placement_priority)
@@ -911,5 +1446,134 @@ impl Placer<'_, '_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A pool of empty elements, told apart by identity, with these limits.
+    fn pool(entries: &[(i32, Value)]) -> Arc<Pool> {
+        let (mut templates, mut indices, mut raw, mut rules, mut limits) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, (weight, element)) in entries.iter().enumerate() {
+            let e = Arc::new(PoolElement::Empty);
+            for _ in 0..*weight {
+                templates.push(e.clone());
+                indices.push(i);
+            }
+            raw.push((e, *weight));
+            rules.push(Rules::of(element));
+            limits.push(Limit::of(element));
+        }
+        let guaranteed = (0..entries.len())
+            .filter(|&i| limits[i].as_ref().is_some_and(|l: &Limit| l.guaranteed))
+            .collect();
+        Arc::new(Pool {
+            templates,
+            entries: indices,
+            raw,
+            rules,
+            limits,
+            guaranteed,
+            fallback: "minecraft:empty".into(),
+            max_size: OnceLock::new(),
+        })
+    }
+    fn delegate() -> Value {
+        json!({"element_type": "minecraft:single_pool_element", "location": "a:b"})
+    }
+    /// The entries a vanilla jigsaw tries below a parent at `depth`: the
+    /// target's by index, the fallback's by index plus 100.
+    fn tried(
+        target: &Arc<Pool>,
+        fallback: &Arc<Pool>,
+        counts: &HashMap<Arc<str>, i32>,
+        depth: i32,
+        below_max: bool,
+    ) -> Vec<usize> {
+        let mut random = LegacyRandom::new(7);
+        let mut candidates =
+            Candidates::new(Draws::Vanilla, target, fallback, below_max, &mut random);
+        let index = |pool: &Arc<Pool>, element: &Arc<PoolElement>| {
+            pool.raw.iter().position(|(e, _)| Arc::ptr_eq(e, element))
+        };
+        let mut out = Vec::new();
+        while let Some(pick) = candidates.next(counts, depth, &mut random) {
+            out.push(
+                index(target, &pick.element)
+                    .or_else(|| index(fallback, &pick.element).map(|i| i + 100))
+                    .unwrap(),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn limits_read_lithostitcheds_fields() {
+        let limited =
+            json!({"element_type": "lithostitched:limited", "limit": 1, "delegate": delegate()});
+        let l = Limit::of(&limited).unwrap();
+        assert_eq!((l.max, l.min_depth, l.guaranteed), (1, 0, false));
+        assert_eq!(*l.key, *limited.to_string());
+        let guaranteed = json!({"element_type": "lithostitched:guaranteed", "count": 2, "min_depth": 3,
+            "delegate": delegate()});
+        let g = Limit::of(&guaranteed).unwrap();
+        assert_eq!((g.max, g.min_depth, g.guaranteed), (2, 3, true));
+        // No limit, or YUNG's (`Rules`): none to keep here.
+        for none in [
+            json!({"element_type": "lithostitched:limited", "delegate": delegate()}),
+            json!({"element_type": "yungsapi:yung_single_element", "name": "pile", "max_count": 2}),
+            delegate(),
+        ] {
+            assert!(Limit::of(&none).is_none(), "{none}");
+        }
+    }
+
+    #[test]
+    fn vanilla_jigsaws_keep_lithostitcheds_limits() {
+        let limited =
+            json!({"element_type": "lithostitched:limited", "limit": 1, "delegate": delegate()});
+        let guaranteed = json!({"element_type": "lithostitched:guaranteed", "count": 1, "min_depth": 3,
+            "delegate": delegate()});
+        let p = pool(&[
+            (3, delegate()),
+            (2, limited.clone()),
+            (1, guaranteed.clone()),
+        ]);
+        let empty = pool(&[]);
+        let mut counts = HashMap::new();
+        // Too shallow for the guaranteed entry: the weight-expanded list without it.
+        let mut shallow = tried(&p, &empty, &counts, 2, true);
+        shallow.sort();
+        assert_eq!(shallow, [0, 0, 0, 1, 1]);
+        // Deep enough: it comes first, and is not drawn again.
+        let deep = tried(&p, &empty, &counts, 3, true);
+        assert_eq!(deep[0], 2);
+        assert_eq!(deep[1..].iter().filter(|&&e| e == 2).count(), 0);
+        // At the most depth only the fallback is tried.
+        assert!(tried(&p, &empty, &counts, 3, false).is_empty());
+        // Entries at their limit are skipped.
+        counts.insert(Arc::from(limited.to_string()), 1);
+        counts.insert(Arc::from(guaranteed.to_string()), 1);
+        let full = tried(&p, &empty, &counts, 3, true);
+        assert_eq!(full, [0, 0, 0]);
+    }
+
+    /// A fallback pool's guaranteed entries come first once it is reached,
+    /// below the most depth as at it (rdbtCVS's review of #1777).
+    #[test]
+    fn a_fallbacks_guaranteed_entries_are_tried() {
+        let guaranteed = json!({"element_type": "lithostitched:guaranteed", "count": 1,
+            "delegate": delegate()});
+        let target = pool(&[(2, delegate())]);
+        let fallback = pool(&[(1, delegate()), (1, guaranteed)]);
+        let counts = HashMap::new();
+        let below = tried(&target, &fallback, &counts, 0, true);
+        assert_eq!(below[..2], [0, 0]);
+        assert_eq!(below[2..], [101, 100]);
+        assert_eq!(tried(&target, &fallback, &counts, 0, false), [101, 100]);
     }
 }

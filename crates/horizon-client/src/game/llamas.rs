@@ -25,14 +25,16 @@ impl Game<'_> {
         };
         let m = &mut self.mobs[index];
         let mut used = false;
+        let mut loved = false;
         if item == "minecraft:hay_block" && m.extra.tame && m.extra.age == 0 && m.extra.in_love <= 0
         {
             m.extra.in_love = 600;
             m.extra.love_player = true;
             used = true;
+            loved = true;
         }
         if m.health < m.attrs.max_health {
-            m.health = (m.health + heal).min(m.attrs.max_health);
+            m.heal(heal);
             used = true;
         }
         let mut happy = false;
@@ -56,6 +58,14 @@ impl Game<'_> {
         }
         if !used {
             return false;
+        }
+        // Animal.setInLove: entity event 18.
+        if loved {
+            let id = self.mobs[index].id;
+            self.love_cause.insert(id, self.lan_acting);
+            let kind = self.mobs[index].kind.id.clone();
+            self.native_entity_enter_love_mode(id, &kind, self.lan_acting_uuid);
+            self.mob_event_particles(id, 18);
         }
         self.llama_sound(index, "entity.llama.eat", 1.0);
         self.consume_held();
@@ -93,7 +103,8 @@ impl Game<'_> {
             return false;
         }
         if tamed && sneaking {
-            // The horse inventory screen is not available yet.
+            // AbstractHorse.openCustomInventoryScreen.
+            self.open_mount_menu(index);
             return true;
         }
         let m = &self.mobs[index];
@@ -122,6 +133,9 @@ impl Game<'_> {
         }
         // doPlayerRide; mounting drops a lead.
         let id = self.mobs[index].id;
+        if !self.native_may_board(id) {
+            return true;
+        }
         self.break_leash(id, true, false);
         let m = &mut self.mobs[index];
         m.extra.flag = false;

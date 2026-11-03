@@ -25,6 +25,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from . import lab
+except ImportError:
+    import lab
+
 ROOT = Path(__file__).resolve().parent.parent
 SEED = "1234"
 WORLD = "GraphicsBench"
@@ -48,14 +53,15 @@ guiScale:0
 
 def vscreen_env():
     out = subprocess.run(["vscreen", "env"], cwd=ROOT, capture_output=True, text=True, check=True)
-    env = dict(os.environ)
+    env = lab.game_env()
     for part in out.stdout.replace(";", " ").split():
         if "=" in part and not part.startswith("export"):
             k, v = part.split("=", 1)
             env[k] = v
     env.pop("DISPLAY", None)
-    # Benchmark games never play sound on the machine's speakers.
-    env["HORIZON_NO_AUDIO"] = "1"
+    # lab.game_env: no sound on the machine's speakers, and scratch folders instead of the player's.
+    # Benchmark games do not reach the telemetry server (docs/telemetry.md).
+    env["HORIZON_TELEMETRY_URL"] = "off"
     return env
 
 
@@ -153,7 +159,7 @@ def main():
     p.add_argument("--seconds", type=float, default=12.0, help="flight duration per scene")
     p.add_argument("--settle", type=float, default=2.0, help="seconds to wait before each flight")
     p.add_argument("--offscreen", action="store_true", help="render offscreen on the discrete GPU")
-    p.add_argument("--resources", default=str(ROOT / ".local/horizon-client/26.3"))
+    p.add_argument("--resources", default=str(lab.RESOURCES))
     p.add_argument("--build", default=str(ROOT / "target/release"))
     p.add_argument("--out", help="JSON file (default benchmarks/graphics/<label>.json)")
     p.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
@@ -164,7 +170,7 @@ def main():
         return
     ctl = Path(args.build).resolve() / "horizon-ctl"
     if not ctl.exists():
-        sys.exit(f"{ctl} missing: cargo build --release -p horizon-client --bins")
+        sys.exit(f"{ctl} missing: cargo build --release -p horizon-client -p horizon-client-lib --bins")
     cwd = ROOT / ".local/graphics-bench"
     shutil.rmtree(cwd / "saves" / WORLD, ignore_errors=True)
     cwd.mkdir(parents=True, exist_ok=True)

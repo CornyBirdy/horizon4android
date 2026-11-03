@@ -40,8 +40,9 @@ pub trait PlacementContext {
         Ok(())
     }
     /// Block.updateFromNeighbourShapes for the state at `position`, written
-    /// with `flags` when it changes. Worlds without block shape-update
-    /// behavior accept this as a no-op.
+    /// with `flags` when it changes, then LevelAccessor.updateNeighborsAt for
+    /// the new block (a no-op outside a live level). Worlds without block
+    /// shape-update behavior accept this as a no-op.
     fn update_from_neighbour_shapes(
         &mut self,
         _position: [i32; 3],
@@ -211,6 +212,13 @@ pub trait PlacementContext {
     fn water_at(&mut self, _position: [i32; 3]) -> Result<bool, PlacementQueryError> {
         Err(PlacementQueryError::Unavailable)
     }
+    /// `BlockState.canOcclude()` of a state.
+    fn can_occlude(
+        &mut self,
+        _state: crate::registry::BlockStateId,
+    ) -> Result<bool, PlacementQueryError> {
+        Err(PlacementQueryError::Unavailable)
+    }
     /// Multiface attachment: neighbor support, then empty-context collision.
     fn attachment_at(
         &mut self,
@@ -344,6 +352,18 @@ pub trait PlacementContext {
     /// World minimum, which can differ from the generator's minimum.
     fn min_y(&mut self) -> Result<i32, PlacementQueryError>;
     fn height(&mut self, kind: HeightmapType, x: i32, z: i32) -> Result<i32, PlacementQueryError>;
+    /// Whether any column of the square `x..=x + size`, `z..=z + size` has
+    /// `height(kind)` at least `y`, read faster than column by column; `None`
+    /// when the world can't (callers then ask `height` for each column).
+    fn any_height_at_least(
+        &mut self,
+        _kind: HeightmapType,
+        _corner: [i32; 2],
+        _size: i32,
+        _y: i32,
+    ) -> Result<Option<bool>, PlacementQueryError> {
+        Ok(None)
+    }
 }
 impl PlacementContext for WorldGenerationContext {
     fn max_y(&mut self) -> Result<i32, PlacementQueryError> {

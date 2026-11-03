@@ -169,6 +169,20 @@ def corpus(wants):
                 kv.append(f'lastrestock={rng.randrange(0, 10**6)}')
                 kv.append(f'restocks={rng.randrange(3)}')
         cases.append(f'nbt n{k} ' + ' '.join(kv))
+    # The restock gaps exactly: the second restock of a day needs more than
+    # 2400 ticks since the last one and a third never happens, while a new day
+    # needs more than 12000; and the cheapest offers under a major-positive
+    # reputation with Hero of the Village, where the discount cannot take a
+    # price below one item.
+    cases.append('restock b0 seed=3 v=farmer:plains:1 lastrestock=100 restocks=0 '
+                 'steps=use:0:4,check:2400:0,check:2401:0,use:0:1,check:2500:0,use:0:1,check:2520:0')
+    cases.append('restock b1 seed=3 v=farmer:plains:1 lastrestock=100 restocks=2 '
+                 'steps=use:0:4,check:3000:0,use:0:1,check:12100:0,check:12101:0')
+    cases.append('restock b2 seed=3 v=librarian:plains:3 lastrestock=0 restocks=2 '
+                 'steps=use:1:6,check:12000:1,check:12001:1,use:1:1,check:12600:1,check:24001:2')
+    cases.append('price b3 seed=5 v=fisherman:plains:1 gossip=major_positive:100 hero=4')
+    cases.append('price b4 seed=5 v=shepherd:plains:1 gossip=major_positive:100 gossip=major_positive:100 '
+                 'hero=1 uses=0:3 uses=1:3')
     return cases
 
 
@@ -182,9 +196,9 @@ def main():
     if args.prepare:
         lab.prepare()
     lock, jars, libraries = base.verify_artifacts()
-    resources = lab.LOCAL / 'horizon-client/26.3'
+    resources = lab.RESOURCES
     oracle = lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity/VanillaTradingOracle.java'
-    sources = [oracle, Path(__file__), lab.ROOT / 'crates/horizon-client/examples/trading_fixture.rs',
+    sources = [oracle, Path(__file__), lab.ROOT / 'crates/horizon-client/examples/probe/trading_fixture.rs',
                lab.ROOT / 'crates/horizon-client/src/merchant.rs', lab.ROOT / 'crates/horizon-client/src/menu.rs']
     tested = base.source_hashes([s for s in sources if s.exists()])
     inputs = build / 'inputs.txt'
@@ -219,9 +233,9 @@ def main():
     if args.java_only:
         print(f'{len(vanilla)} oracle lines')
         return
-    run(['cargo', 'build', '--release', '-p', 'horizon-client', '--example', 'trading_fixture'], 'compile-rust')
-    binary = lab.cargo_target() / 'release/examples/trading_fixture'
-    run([binary, resources, inputs, build / 'server.txt', build / 'rust.txt'], 'rust')
+    run(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-client-lib', '--example', 'client_probe'], 'compile-rust')
+    binary = lab.cargo_target() / 'fast/examples/client_probe'
+    run([binary, 'trading_fixture', resources, inputs, build / 'server.txt', build / 'rust.txt'], 'rust')
     rust = (build / 'rust.txt').read_text().splitlines()
     bad = [(a, b) for a, b in zip(vanilla, rust) if a != b]
     if bad or len(vanilla) != len(rust):

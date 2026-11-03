@@ -11,6 +11,7 @@ use horizon_core::geometry::{Direction, ShapeOp, VoxelShape};
 use std::{
     collections::{BTreeMap, HashMap},
     io,
+    sync::Arc,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,13 +40,28 @@ struct State {
 }
 /// Prepared face geometry and a bounded cache shared across state pairs. Geometry
 /// is deduplicated by the imported immutable shape, not copied for every state.
+/// A clone (each meshing worker keeps one, with its own cache) shares the states
+/// and faces, which never change once made.
 #[derive(Clone)]
 pub struct FaceVisibility {
-    states: Vec<State>,
-    faces: Vec<VoxelShape>,
+    states: Arc<[State]>,
+    faces: Arc<[VoxelShape]>,
     cache: HashMap<(u32, u32), bool>,
 }
 impl FaceVisibility {
+    /// No state's faces, for a server, which draws nothing: every lookup
+    /// answers "unknown render state".
+    pub fn empty() -> Self {
+        Self {
+            states: Arc::new([]),
+            faces: Arc::new([VoxelShape::empty(), VoxelShape::block()]),
+            cache: HashMap::new(),
+        }
+    }
+    /// [`Self::empty`]: no state is known.
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
     pub fn new(
         occlusion: &CachedCollisionRegistry<'_>,
         definitions: &BTreeMap<String, RenderDefinition>,
@@ -127,8 +143,8 @@ impl FaceVisibility {
             });
         }
         Ok(Self {
-            states,
-            faces,
+            states: states.into(),
+            faces: faces.into(),
             cache: HashMap::new(),
         })
     }
@@ -157,12 +173,6 @@ impl FaceVisibility {
             }
         }
     }
-    /// Whether the state's occlusion face toward `direction` is the full square.
-    pub fn full_face(&self, state: BlockStateId, direction: Direction) -> bool {
-        self.states
-            .get(state.0 as usize)
-            .is_some_and(|s| s.faces[direction as usize] == 1)
-    }
     /// The state's occlusion face toward `direction` (`getFaceOcclusionShape`) and
     /// its shared ID: 0 is the empty singleton, 1 the full-block singleton.
     pub fn occlusion_face(
@@ -172,12 +182,6 @@ impl FaceVisibility {
     ) -> Option<(u32, &VoxelShape)> {
         let id = self.states.get(state.0 as usize)?.faces[direction as usize];
         Some((id, &self.faces[id as usize]))
-    }
-    /// Whether the state's occlusion face toward `direction` is empty.
-    pub fn empty_face(&self, state: BlockStateId, direction: Direction) -> bool {
-        self.states
-            .get(state.0 as usize)
-            .is_none_or(|s| s.faces[direction as usize] == 0)
     }
     pub fn skip_rendering(
         &self,
@@ -224,5 +228,30 @@ impl FaceVisibility {
         }
         self.cache.insert(key, visible);
         Ok(visible)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server's empty visibility knows no state: lookups fail instead of
+    /// panicking.
+    #[test]
+    fn empty_visibility_knows_no_state() {
+        let mut visibility = FaceVisibility::empty();
+        assert!(visibility.is_empty());
+        let stone = BlockStateId(1);
+        assert!(visibility.occlusion_face(stone, Direction::Up).is_none());
+        assert!(
+            visibility
+                .skip_rendering(stone, stone, Direction::Up, true)
+                .is_err()
+        );
+        assert!(
+            visibility
+                .should_render_face(stone, stone, Direction::Up, true)
+                .is_err()
+        );
     }
 }

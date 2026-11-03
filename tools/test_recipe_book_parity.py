@@ -5,10 +5,11 @@ Each case runs a sequence of operations on a fresh book: awarding recipes
 (advancement rewards, /recipe give, crafting; special recipes are never
 learnt, and the count is the displays added), taking them back, the client
 having seen a highlighted recipe, the open and filter settings of the four
-book types, and saving and loading the player's recipeBook compound (with
-unknown ids dropped, and a compound missing a list ignored). The Java oracle
+book types (through the serverbound settings packet's codec), and saving and
+loading the player's recipeBook compound (with unknown ids dropped, and a
+compound missing a list ignored). The Java oracle
 (VanillaRecipeBookOracle) drives ServerRecipeBook and its codec;
-examples/recipe_book_fixture drives horizon_client::recipe_book. After each
+examples/probe/recipe_book_fixture drives horizon_client::recipe_book. After each
 operation the count, the known and highlighted recipes, the settings and
 the saved compound are compared.
 """
@@ -35,6 +36,12 @@ def main():
     ids = sorted('minecraft:' + p.stem for p in (lib.RESOURCES / 'data/minecraft/recipe').glob('*.json'))
     rng = random.Random(args.seed)
     cases = []
+    # Every book and flag combination crosses the wire, then survives a save/load.
+    for book_type in TYPES:
+        for opened in (False, True):
+            for filtering in (False, True):
+                cases.append({'ops': [{'op': 'set', 'type': book_type, 'open': opened,
+                                       'filtering': filtering}, {'op': 'save'}, {'op': 'load'}]})
     for _ in range(args.cases):
         ops, known = [], set()
         for _ in range(rng.randrange(1, 12)):
@@ -59,6 +66,16 @@ def main():
                     op['drop'] = rng.choice(['recipes', 'toBeDisplayed'])
                 ops.append(op)
         cases.append({'ops': ops})
+    # An empty batch, a recipe the book never had, a highlight taken back
+    # twice, and the settings of all four book types carried through a save
+    # and a load: states the random batches leave out.
+    cases.append({'ops': [{'op': 'give', 'ids': []}, {'op': 'take', 'ids': []}, {'op': 'save'}, {'op': 'load'}]})
+    cases.append({'ops': [{'op': 'take', 'ids': ids[:4]}, {'op': 'seen', 'id': ids[0]},
+                          {'op': 'seen', 'id': ids[0]}, {'op': 'save'}, {'op': 'load'}, {'op': 'seen', 'id': ids[1]}]})
+    cases.append({'ops': [{'op': 'give', 'ids': ids[:6]},
+                          *[{'op': 'set', 'type': t, 'open': o, 'filtering': f}
+                            for t in TYPES for o, f in ((True, False), (False, True))],
+                          {'op': 'save'}, {'op': 'load'}, {'op': 'save'}, {'op': 'load', 'drop': 'toBeDisplayed'}]})
     (work / 'cases.jsonl').write_text(''.join(json.dumps(c) + '\n' for c in cases))
     vanilla.run('VanillaRecipeBookOracle', work / 'cases.jsonl', work / 'native.txt')
     lib.cargo_example('horizon-client', 'recipe_book_fixture', lib.RESOURCES, work / 'cases.jsonl', work / 'rust.txt')

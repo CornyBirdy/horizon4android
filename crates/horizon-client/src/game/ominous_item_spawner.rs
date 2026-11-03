@@ -1,8 +1,7 @@
 //! `OminousItemSpawner`: the item an ominous trial spawner drops on its
 //! fight. It floats, growing and turning (`OminousItemSpawnerRenderer`), for
 //! 60 to 120 ticks, then falls as an item or is fired straight down as a
-//! projectile (`spawnItem`). Not saved: a spawner left in an unloaded chunk
-//! is lost.
+//! projectile (`spawnItem`). Saved with its chunk's entities (persist.rs).
 use super::Game;
 use horizon_assets::item_model::DisplayContext;
 use horizon_client::{
@@ -22,10 +21,18 @@ const TICKS_SCALING: f32 = 50.0;
 const ROTATION_SPEED: f32 = 40.0;
 
 pub(super) struct OminousItemSpawner {
-    item: ItemStack,
-    position: [f64; 3],
-    spawn_item_after: i64,
+    /// Its entity id: from the entity counter on the server, the server's on
+    /// a client.
+    pub(super) id: u32,
+    /// `DATA_ITEM`; `minecraft:air` stands for `ItemStack.EMPTY`.
+    pub(super) item: ItemStack,
+    pub(super) position: [f64; 3],
+    pub(super) spawn_item_after: i64,
     tick_count: i64,
+    /// Its UUID, and the compound it was loaded from (fields Horizon doesn't
+    /// model survive a save).
+    pub(super) uuid: [i32; 4],
+    pub(super) raw: Option<Box<horizon_world::nbt::Tag>>,
 }
 
 /// `ProjectileItem.DispenseConfig` of the items fired down: power,
@@ -61,11 +68,35 @@ impl Game<'_> {
         position: [f64; 3],
         delay: i32,
     ) {
+        self.next_entity += 1;
         self.ominous_spawners.push(OminousItemSpawner {
+            id: self.next_entity,
             item,
             position,
             spawn_item_after: i64::from(delay),
             tick_count: 0,
+            uuid: horizon_client::save::random_uuid(),
+            raw: None,
+        });
+    }
+    /// A saved spawner, as `readAdditionalSaveData` leaves it: its tick
+    /// count starts again from 0.
+    pub(super) fn load_ominous_item_spawner(&mut self, tag: horizon_world::nbt::Tag) {
+        let Some((item, at, spawn_item_after)) =
+            horizon_client::entity_nbt::ominous_item_spawner_from_nbt(&tag)
+        else {
+            return;
+        };
+        self.next_entity += 1;
+        self.ominous_spawners.push(OminousItemSpawner {
+            id: self.next_entity,
+            item,
+            position: [at.x, at.y, at.z],
+            spawn_item_after,
+            tick_count: 0,
+            uuid: horizon_client::entity_nbt::uuid(&tag)
+                .unwrap_or_else(horizon_client::save::random_uuid),
+            raw: Some(Box::new(tag)),
         });
     }
     /// Every item spawner's tick: `commonTick`'s count, `tickServer` (the
@@ -98,9 +129,39 @@ impl Game<'_> {
         kept.append(&mut self.ominous_spawners);
         self.ominous_spawners = kept;
     }
+    /// `handleAddEntity` for a spawner a server sent: its item comes with the
+    /// entity data (`ItemStack.EMPTY` until then, which draws nothing).
+    pub(super) fn add_remote_ominous_item_spawner(&mut self, id: u32, position: [f64; 3]) {
+        self.ominous_spawners.push(OminousItemSpawner {
+            id,
+            item: ItemStack::new("minecraft:air", 1),
+            position,
+            spawn_item_after: 0,
+            tick_count: 0,
+            uuid: [0; 4],
+            raw: None,
+        });
+    }
+    /// `OminousItemSpawner.tick` on a client: `tickCount` and `tickClient`,
+    /// the particles every 5 game ticks; only the server spawns the item.
+    pub(super) fn tick_remote_ominous_item_spawners(&mut self) {
+        let at: Vec<[f64; 3]> = self.ominous_spawners.iter().map(|s| s.position).collect();
+        for s in &mut self.ominous_spawners {
+            s.tick_count += 1;
+        }
+        if self.world.game_time % 5 == 0 {
+            for position in at {
+                self.ominous_spawner_particles(position);
+            }
+        }
+    }
     /// `spawnItem`: a projectile shot down, or an item entity; level event
     /// 3021 and the entity_place game event.
     fn spawn_ominous_item(&mut self, s: &OminousItemSpawner) {
+        // An empty item spawns nothing, and no event marks it.
+        if &*s.item.item == "minecraft:air" {
+            return;
+        }
         let at = block(s.position);
         let p = s.position;
         match projectile(&s.item.item) {

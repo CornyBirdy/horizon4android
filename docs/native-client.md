@@ -15,7 +15,7 @@ missing; [Rust rewrite status](rust-parity.md) has the details.
 ## Run from a checkout
 
 Use current stable Rust (1.90+) and JDK 25 (Python 3.10+ only for the development
-harnesses). Horizon never
+harnesses). A checkout never
 downloads the game: resource preparation imports **your own copy** (the 26.3
 client from your official launcher install, and the 26.3 server jar you
 downloaded yourself; see [Build from source](../README.md#build-from-source)),
@@ -35,6 +35,37 @@ Preparation is `horizon-prepare` (`crates/horizon-prepare`, Rust): it needs no P
 the JDK, for the small exporters that call Mojang's own code. Release folders ship it beside
 `horizon-client`, and the launcher prepares with it and copies the sounds as part of preparing.
 
+`--output DIR` puts the resources elsewhere (the exporters' scratch files stay in the version
+folder's `.local/`), for preparing and for the asset commands alike. `horizon-prepare --check`
+exits 0 when the resources are complete and current for this preparer, and otherwise prints
+each gap with the command that fills it on stdout and exits 1. It also exits 1 when it can't
+check, with `error:` on stderr (no `research-lock.json`, say). It runs no Java and reads no game
+files: it tests which files are there and the versions they were made for, not their contents, so
+a launcher that suspects damage prepares again. A preparation stamps its resources with the
+preparer's `OUTPUT_VERSION` (`horizon-prepare.json`) when it finishes, and removes the stamp
+before it writes anything, so `--check` reports a folder being prepared, or whose preparation
+stopped, as not current. Resources prepared before the stamp existed report an unknown version
+until they are prepared again. One preparation at a time writes to a folder: each holds
+`.horizon-prepare.lock` in the resources and in the version folder's `.local/`, and a second one
+waits for the first. `--complete` prepares, copies the sounds, and fails unless `--check` would
+then pass: one command for resources with nothing missing. `--progress json` prints one JSON
+object a line instead of plain text (its format is part of the Launch API:
+[docs/api/launch.md](api/launch.md#--progress-json)). Exit codes: 0 done, 1 failed or gaps found,
+2 a refused command line.
+
+A launcher whose files are laid out its own way names them one by one instead of
+`--minecraft-dir`: `--version-json` (the pinned version's JSON), `--client-jar`,
+`--libraries-dir` (the client's libraries, Maven layout) and `--assets-dir` (the asset store,
+with `indexes/` and `objects/`); each replaces only what it names, and every file is still
+checked against `research-lock.json`'s pins. When an earlier import beside `--root` is still
+verified, it is reused and the named files aren't read. Two things no such launcher keeps:
+- **The server jar.** The first `--prepare` needs `--server-jar`. Horizon never downloads it; a
+  launcher downloads it (the version JSON's `downloads.server`) only for a signed-in account that
+  owns Minecraft: Java Edition, as `horizon-launcher` does.
+- **Java 25.** `--java-home PATH` names a runtime the launcher manages. The preparer takes the first
+  Java of the pinned version from `JAVA_HOME`, the `PATH`, `--java-home`, then the official
+  launcher's runtimes.
+
 ```sh
 cargo run --release -p horizon-prepare -- --prepare --server-jar ~/Downloads/server.jar
 cargo run --release -p horizon-prepare -- sounds
@@ -43,12 +74,15 @@ cargo run --release -p horizon-client -- --render-distance 12
 
 Development builds that link quickly: `cargo build --profile fast -p horizon-client`.
 
+Optional Windows allocator build features are documented in
+[Windows allocator experiments](windows-allocators.md).
+
 | Option | Meaning |
 | --- | --- |
 | `--world NAME` | World folder under `saves/` (default "New World"); reopened if it exists |
 | `--seed N` | Seed for a new world (numbers or text, like vanilla) |
 | `--creative` | Creative mode (instant breaking, pick block) |
-| `--render-distance N` | Chunks, 2..64 (default 12) |
+| `--render-distance N` | Chunks, 2..128 (default 12) |
 | `--resources PATH` | Prepared resource directory |
 
 | Control | Action |
@@ -61,6 +95,7 @@ Development builds that link quickly: `cargo build --profile fast -p horizon-cli
 | E | Inventory and 2x2 crafting (shift-click to quick-move or craft all) |
 | Q / Ctrl+Q | Drop one / drop stack |
 | F3 | Debug overlay (position, chunk, light, biome, FPS) |
+| F3 + S | Dump the texture atlas to `screenshots/debug/`: `minecraft_textures_atlas_gui.png` with `minecraft_textures_atlas_gui.txt` beside it, every sprite's rect in texels (vanilla's `TextureManager.dumpAllSheets`) |
 | Esc | Pause menu (Save and Quit) |
 
 Worlds autosave every 6000 ticks (5 minutes), when chunks unload and on quit.
@@ -85,7 +120,7 @@ local socket; under control, losing window focus does not pause the game or
 release held keys, so a script can play while you use other windows.
 
 ```sh
-cargo build --release -p horizon-client --bins
+cargo build --release -p horizon-client -p horizon-client-lib --bins
 C=target/release/horizon-ctl
 $C launch --world Survival --seed 5 --wait   # start the game, open or create the world, wait for it
 $C state                                     # player, world, screen, crosshair target
@@ -119,7 +154,7 @@ game accepts, test hooks included.
   `place X Y Z [--item ITEM]`, `interact X Y Z` (doors, chests, crafting
   tables), `use-item [--hold S]` (eat, drink, throw), `select SLOT|ITEM`, `drop`.
 - **Widgets:** `ui` lists every widget of the open screen (title menus, pause,
-  options pages in both menu styles, inventories and menus): an id, its kind
+  options pages, inventories and menus): an id, its kind
   (`button`, `slider` with its 0..1 `value`, `field`, `row`, `tab` with
   `selected`, `slot` with its stack), the label and its bounds. Ids come from
   labels (`FOV: 70` is `fov`, `Video Settings...` is `video-settings`, a
@@ -144,7 +179,7 @@ game accepts, test hooks included.
 - **Screens:** `open-inventory`, `click-slot SLOT [right] [shift]` (0-8 hotbar,
   9-35 inventory, 100+ crafting grid, 200 result, 300+ containers, 500-503
   armor, 504 offhand, 600+ stations), `close`, `click-button LABEL` (any
-  button of any screen or title menu, classic or Horizon style, by its label),
+  button of any screen or title menu, by its label),
   `click-at X Y`, `type TEXT` (on the create-world screen `--field name|seed
   --replace`), `chat`, `command`, `respawn`, `pause`, `resume`.
 - **World:** `tp`, `give`, `time`, `setblock`, `summon`, `wait TICKS`, and the
@@ -207,6 +242,39 @@ constant speed and replies with the same summary as `bench` (avg/1%-low FPS and
 p50/p95/p99/max frame times), plus CPU and GPU time per frame; [the graphics
 benchmark](graphics.md#benchmark) is built on it. Frame times include waits for
 presentation, so `bench` reports what is on screen.
+
+### RAM limit
+
+`HORIZON_MEMORY_LIMIT_MB` (the launcher sets it) and `/ramlimit`, `/ramlimit <MB>`, `/ramlimit off` limit
+the RAM the game holds; the command lasts until the game closes and works on any server, as the window
+answers it. On Windows the system enforces the limit with a hard working set limit, so memory the game
+uses least moves out of RAM and a low limit costs speed. If the game is also slow and faulting hard, far
+terrain goes off and the render distance in use drops, never the saved option, and both come back when
+there is room. Linux and macOS have no such limit: there the game steps down before it reaches the limit.
+The game ends with a crash report only when it can't run under the limit: on Windows no frame for a minute
+while faulting hard, elsewhere 20 seconds over the limit with nothing left to give up.
+
+### Discord Rich Presence
+
+While Discord runs on the same computer, the player's Discord profile shows
+"Playing Horizon" and what they are doing: "In the menus", "Singleplayer",
+"Multiplayer" or "Hosting a world" (with the party size, of 8), the dimension
+("In the Nether") and the time since they entered the world. It never shows a
+world's name or a server's address. Horizon Settings has the switch
+(**Discord Rich Presence**, on by default; `discordPresence` in
+`horizon-extras.txt`), and `HORIZON_NO_DISCORD=1` turns it off for one run.
+
+`crates/horizon-client/src/discord_presence.rs` speaks Discord's local IPC
+itself (the `discord-ipc-N` socket or named pipe, no SDK) from a thread of its
+own: the frame only hands it a status when it changes. It retries every 15 s
+while Discord isn't running and stays within Discord's 5 updates per 20 s.
+Dedicated servers never start it, and automated runs (offscreen, benchmarks)
+only talk to a fake Discord: `lab.game_env` sets `HORIZON_NO_DISCORD=1`, and
+`tools/discord_presence_e2e.py` points games at a fake server with
+`HORIZON_DISCORD_IPC_DIR` (title, world, Nether and quit on both single-player
+paths; a LAN host and guest; the switch; a Discord started after the game).
+`DISCORD_APP_ID` is Discord's "Horizon" application, whose `horizon` image is
+the large one; there are no game-mode images yet.
 
 ### Play on another of your machines
 

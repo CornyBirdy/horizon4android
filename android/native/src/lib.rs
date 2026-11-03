@@ -32,6 +32,10 @@ const RUNNING_FILE: &str = "running.marker";
 /// `HORIZON_NO_AUDIO=1`, `HORIZON_SPRITE_SPLIT=...`) without rebuilding the app. `adb shell` cannot set
 /// them for an app, so they come from a file in the game folder.
 const ENV_FILE: &str = "horizon-env.txt";
+/// The Microsoft account the player imported on the start screen, in the app's private folder
+/// (the Java side writes it): the session JSON of `docs/api/launch.md`, which online-mode
+/// servers need. See [`hand_session_to_game`].
+const SESSION_FILE: &str = "horizon-session.json";
 
 #[link(name = "log")]
 unsafe extern "C" {
@@ -147,6 +151,7 @@ fn start(app: &AndroidApp, files: &Path) -> Result<(), String> {
         Err(e) => log::warn!("Horizon: could not write the phone defaults: {e}"),
     }
     check_resources(files)?;
+    hand_session_to_game(&internal);
     winit_host::set_android_app(app.clone());
     if let Err(error) = horizon_client::run_game() {
         log::error!("Horizon: {error}");
@@ -158,6 +163,42 @@ fn start(app: &AndroidApp, files: &Path) -> Result<(), String> {
         return Err(message);
     }
     Ok(())
+}
+
+/// Gives the game the imported Microsoft account, the way the desktop launcher does: a fresh file
+/// that only this app can read, which the game reads once and deletes at once
+/// (`--session-file`, here `HORIZON_SESSION_FILE`). The imported JSON stays in the private
+/// folder, so every start hands over a new copy; the game refuses a copy older than two minutes
+/// and one other users can read, which is why it is made again each time and with mode 0600.
+/// Without an imported account (or when it cannot be handed over) the game plays offline, and
+/// online-mode servers refuse it with a message that says why.
+fn hand_session_to_game(internal: &Path) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(text) = fs::read_to_string(internal.join(SESSION_FILE)) else {
+        return;
+    };
+    let dir = internal.join("sessions");
+    // Leftovers of runs that never read theirs.
+    let _ = fs::remove_dir_all(&dir);
+    let path = dir.join(format!("session-{}.json", std::process::id()));
+    let made = fs::create_dir_all(&dir).and_then(|()| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(text.as_bytes())
+    });
+    match made {
+        Ok(()) => {
+            // SAFETY: as in `start`: the game's threads are not running yet.
+            unsafe { std::env::set_var("HORIZON_SESSION_FILE", &path) };
+            // The token is never logged, only that an account is handed over.
+            log::info!("Horizon: the imported Microsoft account is handed to the game");
+        }
+        Err(e) => log::warn!("Horizon: could not hand the imported account to the game: {e}"),
+    }
 }
 
 /// Sets the variables in `horizon-env.txt`, returning their names.

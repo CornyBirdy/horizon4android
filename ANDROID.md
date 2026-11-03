@@ -23,11 +23,15 @@ You need a Windows PC once, to prepare the game files from your own Minecraft. T
    Install the Horizon launcher from https://playhorizon.dev, select the version and press **Prepare**. It needs a JDK 25 (Eclipse Temurin) and may ask for the
    26.3 server jar from minecraft.net. Wait for "Prepared for Minecraft 26.3"; a red message under the buttons says what is missing.
 3. **Pack it.** Double-click `android\make-phone-resources.bat` (download this repository as a zip from GitHub to get it, or run
-   `tar -a -c -f %USERPROFILE%\Desktop\horizon-resources.zip -C "<prepared folder>" .` yourself). It finds the launcher's prepared files and writes
+   `tar -a -c -f %USERPROFILE%\Desktop\horizon-resources.zip --exclude horizon-data.bin -C "<prepared folder>" .` yourself). It finds the launcher's prepared files and writes
    `horizon-resources.zip` to the Desktop.
 4. **Send it to the phone**: USB cable into the Download folder, Google Drive, a messaging app, whatever you like.
 5. **Import.** Open Horizon on the phone, tap **Import resources from a zip**, pick `horizon-resources.zip`. (Or **Import resources from a folder** if you copied the
    unzipped folder.) When it says "Imported", tap **Start Horizon**.
+
+6. **Optional, to join online-mode servers:** on the PC sign in to your Microsoft account in the Horizon launcher, double-click
+   `android\make-phone-session.bat`, send the `horizon-session.json` it writes to the phone and tap **Import a Microsoft account**. It lasts about a
+   day. Offline-mode servers and your own worlds need none of this. Details: [Online servers](#online-servers).
 
 `adb` is optional and still works: [Resources](#resources).
 
@@ -39,6 +43,7 @@ You need a Windows PC once, to prepare the game files from your own Minecraft. T
 - [Device setup](#device-setup)
 - [Resources](#resources)
 - [Running](#running)
+- [Online servers](#online-servers)
 - [Controls](#controls)
 - [Defaults for a phone](#defaults-for-a-phone)
 - [Lifecycle: background, rotate, fold](#lifecycle-background-rotate-fold)
@@ -54,25 +59,29 @@ You need a Windows PC once, to prepare the game files from your own Minecraft. T
 android/
   build-apk.sh / build-apk.ps1     the one build script -> dist/horizon-android-debug.apk
   push-resources.sh / .ps1         horizon-prepare -> adb push
+  make-phone-resources.bat / .ps1  the PC helper that packs the launcher's prepared files
+  make-phone-session.bat / .ps1    the PC helper that writes the Microsoft account session for the phone
   native/                          crate horizon-android (cdylib): android_main, logcat, JNI entry points
   app/AndroidManifest.xml          two activities
   app/java/dev/horizon/android/
     LauncherActivity.java          the front door and the readable error screen
     HorizonActivity.java           NativeActivity subclass: mouse, pointer capture, thermal, back = Escape
 crates/horizon-client/src/
-  game.rs  game/*.rs               the desktop game loop, unchanged in behaviour; part of the library on Android
+  game.rs  game/*.rs               the desktop game loop, unchanged in behaviour
   game/touch.rs                    touch controls and the Android mouse in the game loop
   game/surface.rs                  the window's surface coming and going
   touch.rs                         touch controls as pure logic (fingers in, actions out; unit tests)
-  platform.rs                      events from the Java side, requests to it, thermal state
   mobile.rs                        first-run phone defaults
   winit_host.rs                    the event loop per platform
+crates/horizon-client-core/src/
+  platform.rs                      events from the Java side, requests to it, thermal state, the log sink
 ```
 
-The game itself is the desktop client's: `game.rs` and its modules are compiled into the `horizon-client`
-library on Android (they are the binary's private modules on the desktop), and `horizon_client::run_game()`
-is the loop `main` runs. The `horizon-android` library is the thin layer around it: it sets up the game
-folder, logging and crash reports and starts that loop on the thread `android-activity` gives it.
+The game itself is the desktop client's: `game.rs` and its modules are part of the `horizon-client`
+library (since the upstream split into `horizon-client-*` crates they are on every platform), and
+`horizon_client::run_game()` is the startup `main` runs (`entry::main_with`: mods, hooks, the game loop), minus what the app
+already did and with a failed run handed back instead of ending the process. The `horizon-android` library is the thin layer around
+it: it sets up the game folder, logging and crash reports and starts that loop on the thread `android-activity` gives it.
 
 The app has two activities in two processes:
 
@@ -124,7 +133,6 @@ android/build-apk.sh --install
 | --- | --- |
 | `--release` / `-Release` | Full optimisation with thin LTO. The default is the `fast` profile: optimised, no LTO, many codegen units, incremental. Slower to build, a little faster to run. |
 | `--no-audio` / `-NoAudio` | Leave sound (`cpal`) out, if it fails to build or run. |
-| `--mods` / `-Mods` | Build the WebAssembly mod runtime (`wasmtime`) in. |
 | `--skip-native` / `-SkipNative` | Reuse the last native library (only Java or resources changed). |
 | `--install` / `-Install` | `adb install -r` the APK on the connected phone. |
 
@@ -137,8 +145,8 @@ The first build compiles the whole game for ARM64 and takes a while. The script:
 3. signs it with the standard debug key (`~/.android/debug.keystore`, created if missing), so a rebuilt APK
    installs over the last one and keeps the game folder.
 
-Mods with code (WebAssembly, `wasmtime`) are left out of the Android build by default (a smaller, quicker build, and one dependency
-less to go wrong); `--mods` builds them in. Content-only mods work either way.
+Horizon's mods with code are native Rust compiled into the game by `cargo horizon-mod` (there is no WebAssembly runtime any more), so a
+phone gets content mods (blocks, items, data and assets) only; a native mod would need its own build of this app.
 
 ### Build the APK on GitHub (no local setup)
 
@@ -242,6 +250,38 @@ Command-line arguments (the desktop options `--world`, `--creative`, `--render-d
 
 Quit from the title screen by leaving the app (Home, then swipe it away), or use *Save and Quit to Title* in the pause menu and
 close the app. Closing the activity saves the world first.
+
+## Online servers
+
+Upstream Horizon can join **online-mode** servers (the ones that check your Microsoft account, like vanilla does). The game side of that is
+the desktop code and is built into the app unchanged; what an app lacks is the part that signs in, which upstream does in the Horizon
+*launcher* ([microsoft-account.md](docs/microsoft-account.md)). The Android app has no launcher, and it cannot sign in itself: the
+sign-in needs the Microsoft/Mojang app registration that belongs to the upstream author, and this fork does not carry or reuse it. So the account
+comes from a computer:
+
+1. On the PC, sign in to your Microsoft account in the Horizon launcher (it must own Minecraft: Java Edition) and leave it signed in.
+2. Double-click `android\make-phone-session.bat`. It asks the launcher for a fresh session of that account (`horizon-launcher account session NAME --json`) and
+   writes `horizon-session.json` to the Desktop. `-Account NAME` picks the account, `-Launcher FILE` names `horizon-launcher.exe` if the script cannot find it.
+3. Send the file to the phone and, on the app's start screen, tap **Import a Microsoft account**. The screen shows who is signed in and when the session runs out.
+4. Start Horizon and join the server (*Multiplayer*, or `--server HOST` in `horizon-args.txt`).
+
+What happens inside: the Java screen checks the file has a name, a UUID and an access token and keeps it in the app's private folder (`files/horizon-session.json`).
+At every start the native library writes a fresh copy with mode 0600 and gives its path to the game as `HORIZON_SESSION_FILE`, which is exactly what the launcher
+does on a computer (`--session-file`): the game reads it once, deletes it at once and keeps the token in memory only. The desktop game refuses a session file
+older than two minutes or readable by others, which is why the copy is made again at each start instead of importing the original file.
+
+Things to know:
+
+- **The session lasts about 24 hours** (the Minecraft access token). When a server says "Invalid session", or the start screen says it ran out, run the script again and re-import.
+  The phone never renews it; the launcher does that on the computer.
+- **The file is your login.** Delete `horizon-session.json` from the Desktop and from the phone's Download folder after importing; *Remove the Microsoft account* clears the app's copy.
+- Without an account the game is offline: online-mode servers refuse it with a message that says to import one. Offline-mode servers, LAN and Play with Friends need no account.
+- **Server addresses with SRV redirects** (`play.example.net` pointing at another host and port) are looked up by the game itself with the system's name servers. Android does not
+  hand an app those, so the lookup asks Cloudflare (1.1.1.1) and Google (8.8.8.8) when `/etc/resolv.conf` is not there. If a server only works with its real address and port, use that.
+- TLS to Microsoft, Mojang and the servers' resource packs uses certificates built into the game (no system certificate store), so it does not depend on the phone.
+- Chat signing and the account's chat key use the same session; nothing extra is needed.
+- Not done: signing in on the phone itself (a device-code screen in the app). It needs a Microsoft app registration approved by Mojang; the fork has none.
+- **Not tested:** `make-phone-session` was written from upstream's documentation and has not been run against a real launcher, and nothing here has been tried against a server.
 
 ## Controls
 
@@ -395,7 +435,7 @@ Known limits and decisions that will bite:
 - **No system clipboard** (copy and paste work inside the game only).
 - **Controllers:** `gilrs` and the DualSense code are not built on Android. A Bluetooth gamepad is not used yet (Android delivers its buttons as
   key events; mapping them to the game's controller layer is a small step).
-- **Mods with code** are off by default (no WebAssembly runtime in the Android build).
+- **Mods with code** (native Rust mods) are not in the app; content mods work.
 - **Shader packs, LOD distance, and high render distances** are the desktop's heavy features; they work in principle, but a phone's budget is far smaller.
 - **Display cut-outs and rounded corners:** the game draws under them (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS`); the HUD does not avoid them yet.
 - **Memory:** the game runs in a normal app process; if Android's low-memory killer ends it in the background the last autosave is what remains
@@ -403,27 +443,32 @@ Known limits and decisions that will bite:
 - **Saves and logs live on shared storage** (a FUSE file system on Android 11+): file locks may be missing (the game then runs without its `session.lock`),
   symbolic links cannot be made (the pack cache falls back where it can), and disk access is slower than internal storage.
 - Hover and mouse buttons come from the Java side because winit 0.30's Android backend drops them; a stylus, trackpad gestures and mouse back/forward buttons are not mapped.
-- Multiplayer, LAN, and online sign-in are the desktop code and untested here.
+- **Multiplayer** is the desktop code. Online-mode servers need a Microsoft account imported from a computer ([Online servers](#online-servers)); the app cannot
+  sign in itself. LAN, Play with Friends and offline-mode servers work without an account. None of it has been tried on a phone.
 - Gaps in the touch controls: no pick-block (creative middle click), no swap-hands button, no perspective toggle (F5), no F3.
 
 ## What changed in shared code
 
 The desktop must not change; every Android difference is behind `cfg(target_os = "android")`, `cfg!(...)` that is constant false elsewhere,
-or code that only an Android event can reach. In `crates/horizon-client`:
+or code that only an Android event can reach. In `crates/horizon-client` (and, since upstream's split, the crates named below):
 
-- **New modules** (compiled everywhere, used by Android): `platform`, `touch`, `mobile`, `winit_host`, `game/touch`, `game/surface`.
+- **New modules** (compiled everywhere, used by Android): `platform` (in `horizon-client-core`), `touch`, `mobile`, `winit_host`, `game/touch`, `game/surface`.
   The touch controls are off on the desktop (`HORIZON_TOUCH=1` turns them on for testing there).
-- `lib.rs`: on Android the game loop module is part of the library (`extern crate self as horizon_client;` + `mod game;` + `run_game()`).
+- `lib.rs`: `run_game()` (Android only) runs `entry::main_with`, which is what the desktop `main` runs.
 - `game.rs`: the event loop comes from `winit_host::event_loop()` (identical `EventLoop::new()` off Android); `resumed`/`suspended` handle a
   surface that comes back; `Touch` events; the loading screen takes a finger as a mouse; the loop sleeps without a surface; the launch arguments can
-  come from `horizon-args.txt`; the default resources folder is `resources` (Android only); the mouse grab is virtual on Android.
-- `gfx.rs`: `suspend_surface` / `reattach_surface` / `has_surface`; on Android the device request retries without optional features.
+  come from `horizon-args.txt` (`launch_args()`, read by `Options::read`); `Split` passes `suspended` on to its game; the default resources folder is `resources` (Android only); the mouse grab is virtual on Android.
+- `gfx.rs` (now `horizon-client-render`): `suspend_surface` / `reattach_surface` / `has_surface`; on Android the device request retries without optional features.
 - `game/options.rs`: the frame limit takes the thermal cap (none on the desktop). `game/pad.rs`: the move vector can come from the touch stick; `pad_action` is `pub(super)`.
   `game/pad_menu.rs`: three methods `pub(super)` and the keyboard's top-or-bottom test factored out. `osk.rs`: tap hit testing.
-- `logging.rs`: a logcat sink and, on Android, the other crates' warnings; locks tolerated. `crash.rs`: the Android game thread counts as the main one.
+- `logging.rs`, `crash.rs` (now `horizon-client-render`): a logcat sink and, on Android, the other crates' warnings; locks tolerated. The Android game thread counts as the main one.
   `save.rs`: the session lock is skipped where the file system has none (Android). `clipboard.rs`: the game's own copy on Android.
-- `Cargo.toml`: `arboard` is not an Android dependency; `winit` gets `android-native-activity` on Android; `horizon-mods`' WebAssembly runtime
-  is enabled for every target but Android (where `--features mods` asks for it). `horizon-mods` has a stub (`stub.rs`) with the runtime's surface for builds without it.
+- `Cargo.toml`: `arboard` (in `horizon-client-input`) is not an Android dependency; `winit` gets `android-native-activity` on Android.
+  (`horizon-mods` and its WebAssembly runtime, which the first port had a stub for, are gone upstream.)
+- Upstream's other crates: `horizon-client-core` holds `platform.rs`; `horizon-client-render` holds `gfx.rs` (surface suspend/reattach, the device
+  retry without optional features), `logging.rs` (the logcat sink) and `crash.rs` (the Android game thread counts as the main one);
+  `horizon-client-input` has a no-op `learn_layout` (winit's Android backend has no `key_without_modifiers`); `horizon-protocol`'s SRV lookup falls back to
+  public name servers (Android has no `/etc/resolv.conf`); `entry.rs` skips the logging and crash set-up the app did and returns an Android run's failure.
 - Root `Cargo.toml`: `android/native` is excluded from the workspace (it has its own, like the launcher), so the desktop `Cargo.lock` is untouched.
 
 ## Decisions

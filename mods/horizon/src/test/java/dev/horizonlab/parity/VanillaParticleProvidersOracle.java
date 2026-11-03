@@ -48,8 +48,9 @@ import org.jspecify.annotations.Nullable;
 /** Builds each particle through its real registered ParticleProvider (the real
  * ParticleResources, sprite sets bound to stand-in sprites named after the
  * vanilla particles/*.json textures) in a stand-in ClientLevel (air, an
- * optional stone floor at y 63, no fluids), then ticks it and records its
- * state, the particles and sounds it asks the level for, tick by tick.
+ * optional stone floor at y 63, optionally still water from y 64 to 67),
+ * then ticks it and records its state, the particles and sounds it asks the
+ * level for, tick by tick.
  *
  * Each vanilla Particle owns a RandomSource.create() random seeded from the
  * clock; its seed is recovered after construction (the SEED_UNIQUIFIER value
@@ -67,13 +68,18 @@ public final class VanillaParticleProvidersOracle {
     static <T> T make(Class<T> type) throws Exception { return type.cast(allocate.invoke(unsafe, type)); }
 
     static final class Level0 extends ClientLevel {
-        boolean floor;
+        boolean floor, water;
         List<String> events;
         Level0() { super(null, null, null, null, 0, 0, null, false, 0L, 0); }
+        // Water: still water sources from y 64 to 67 (above the floor, below the open air).
+        boolean wet(BlockPos p) { return water && p.getY() >= 64 && p.getY() <= 67; }
         @Override public BlockState getBlockState(BlockPos p) {
+            if (wet(p)) return Blocks.WATER.defaultBlockState();
             return floor && p.getY() == 63 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState();
         }
-        @Override public FluidState getFluidState(BlockPos p) { return Fluids.EMPTY.defaultFluidState(); }
+        @Override public FluidState getFluidState(BlockPos p) {
+            return wet(p) ? Fluids.WATER.getSource(false) : Fluids.EMPTY.defaultFluidState();
+        }
         @Override public @Nullable BlockGetter getChunkForCollisions(int x, int z) { return this; }
         @Override public boolean hasChunkAt(BlockPos p) { return false; }
         @Override public void addParticle(ParticleOptions o, double x, double y, double z, double xd, double yd, double zd) {
@@ -134,6 +140,11 @@ public final class VanillaParticleProvidersOracle {
             return SpellParticleOption.create(castSpell(type), color, scale);
         if (type == ParticleTypes.DRAGON_BREATH) return PowerParticleOption.create(ParticleTypes.DRAGON_BREATH, scale);
         if (type == ParticleTypes.SCULK_CHARGE) return new SculkChargeParticleOptions(scale);
+        if (type == ParticleTypes.GEYSER || type == ParticleTypes.GEYSER_PLUME)
+            return new GeyserParticleOptions(geyser(type), o.get("water_blocks").getAsInt());
+        if (type == ParticleTypes.GEYSER_BASE || type == ParticleTypes.GEYSER_POOF)
+            return new GeyserBaseParticleOptions(geyserBase(type), o.get("water_blocks").getAsInt(),
+                                                 o.get("burst_impulse_base").getAsFloat());
         if (type == ParticleTypes.SHRIEK) return new ShriekParticleOption((int) scale);
         if (type == ParticleTypes.ITEM)
             return new ItemParticleOption(ParticleTypes.ITEM, new ItemStackTemplate(BuiltInRegistries.ITEM.getValue(Identifier.parse(o.get("item").getAsString()))));
@@ -150,6 +161,8 @@ public final class VanillaParticleProvidersOracle {
         throw new AssertionError("no options for " + id);
     }
     @SuppressWarnings("unchecked") static ParticleType<SpellParticleOption> castSpell(ParticleType<?> t) { return (ParticleType<SpellParticleOption>) t; }
+    @SuppressWarnings("unchecked") static ParticleType<GeyserParticleOptions> geyser(ParticleType<?> t) { return (ParticleType<GeyserParticleOptions>) t; }
+    @SuppressWarnings("unchecked") static ParticleType<GeyserBaseParticleOptions> geyserBase(ParticleType<?> t) { return (ParticleType<GeyserBaseParticleOptions>) t; }
     @SuppressWarnings("unchecked") static ParticleType<BlockParticleOption> castBlock(ParticleType<?> t) { return (ParticleType<BlockParticleOption>) t; }
     @SuppressWarnings("unchecked") static ParticleType<ColorParticleOption> castColor(ParticleType<?> t) { return (ParticleType<ColorParticleOption>) t; }
 
@@ -258,6 +271,7 @@ public final class VanillaParticleProvidersOracle {
                 long seed = c.get("seed").getAsLong();
                 RandomSource random = null;
                 level.floor = c.get("floor").getAsBoolean();
+                level.water = c.has("water") && c.get("water").getAsBoolean();
                 level.events.clear();
                 var p = c.getAsJsonArray("pos"); var v = c.getAsJsonArray("vel");
                 Particle particle = null;

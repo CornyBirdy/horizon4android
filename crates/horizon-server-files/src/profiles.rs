@@ -45,11 +45,32 @@ pub fn resolve(name: &str, online: bool) -> Option<NameAndId> {
 pub fn find_by_name(discovery: &str, name: &str) -> Option<NameAndId> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(15))
-        .user_agent(concat!("Horizon/", env!("CARGO_PKG_VERSION")))
+        .user_agent(&format!("Horizon/{}", horizon_core::release::VERSION))
         .build();
     let doc = json::parse(&agent.get(discovery).call().ok()?.into_string().ok()?, true).ok()?;
     let url = endpoint(&doc, "profiles", "getByName")?.replace("{name}", &name.to_lowercase());
     found(&agent.get(&url).call().ok()?.into_string().ok()?, name)
+}
+
+/// YggdrasilMinecraftSessionService.fetchProfile(id, true), as the management protocol finds a player given by
+/// id that the user cache doesn't know: the `session` / `getProfileById` endpoint, or None.
+pub fn find_by_id(discovery: &str, id: u128) -> Option<NameAndId> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .user_agent(&format!("Horizon/{}", horizon_core::release::VERSION))
+        .build();
+    let doc = json::parse(&agent.get(discovery).call().ok()?.into_string().ok()?, true).ok()?;
+    let url =
+        endpoint(&doc, "session", "getProfileById")?.replace("{profileId}", &format!("{id:032x}"));
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let answer = agent
+        .get(&format!("{url}{separator}unsigned=false"))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let name = json::parse(&answer, true).ok()?.get("name")?.as_string()?;
+    found(&answer, &name).filter(|user| user.id == id)
 }
 
 /// MinecraftServicesKeyInfo.get: the services' public keys from the
@@ -61,7 +82,7 @@ pub fn fetch_profile_key_keys(discovery: &str) -> Result<Vec<RsaPublicKey>, &'st
     const FAILED: &str = "Failed to request Minecraft Services public key";
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(15))
-        .user_agent(concat!("Horizon/", env!("CARGO_PKG_VERSION")))
+        .user_agent(&format!("Horizon/{}", horizon_core::release::VERSION))
         .build();
     let get = |url: &str| agent.get(url).call().ok()?.into_string().ok();
     let doc = get(discovery)

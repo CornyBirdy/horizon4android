@@ -2,10 +2,12 @@
 //! progress (`PlayerAdvancements`) and the predicates criteria test
 //! (`EntityPredicate`, `ItemPredicate`, `LocationPredicate`, the loot
 //! conditions advancements use).
+use horizon_world::lazy_json::LazyJson;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, Weak},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +31,9 @@ pub struct Display {
 pub struct Criterion {
     pub name: String,
     pub trigger: String,
-    pub conditions: Value,
+    /// Read on first test: ~1,300 recipe advancements' criteria, most never
+    /// tested in a game, took ~4 MB as `Value`s.
+    pub conditions: LazyJson,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Rewards {
@@ -53,6 +57,10 @@ pub struct Tree {
     pub by_id: HashMap<String, usize>,
     /// trigger id -> (advancement index, criterion index).
     pub by_trigger: HashMap<String, Vec<(usize, usize)>>,
+    /// `recipe_unlocked` criteria by the recipe they name (`index_recipes`);
+    /// those naming none in `recipes_any`.
+    by_recipe: HashMap<String, Vec<(usize, usize)>>,
+    recipes_any: Vec<(usize, usize)>,
 }
 fn frame(v: &Value) -> Frame {
     match v.as_str() {
@@ -62,25 +70,64 @@ fn frame(v: &Value) -> Frame {
     }
 }
 impl Tree {
+    /// [`Tree::load`], shared while anyone holds it: a server's advancement
+    /// packets (`ServerAdvancements`) and its game's criteria read the same
+    /// files, and each kept its own copy (7 MB). A world whose data packs bring
+    /// advancements gets its own tree ([`Tree::load_with`]).
+    pub fn shared(data: &Path, overlay: &horizon_world::loot::PackOverlay) -> Arc<Tree> {
+        if overlay.kind("advancement").next().is_some() {
+            return Arc::new(Tree::load_with(data, overlay));
+        }
+        static TREES: Mutex<Vec<(PathBuf, Weak<Tree>)>> = Mutex::new(Vec::new());
+        // Held while loading: a second reader waits for the first one's tree.
+        let mut trees = TREES.lock().unwrap_or_else(|e| e.into_inner());
+        trees.retain(|(_, tree)| tree.strong_count() > 0);
+        if let Some(tree) = trees
+            .iter()
+            .find(|(path, _)| path == data)
+            .and_then(|(_, tree)| tree.upgrade())
+        {
+            return tree;
+        }
+        let tree = Arc::new(Tree::load(data));
+        trees.push((data.to_path_buf(), Arc::downgrade(&tree)));
+        tree
+    }
     /// Loads `<data>/<namespace>/advancement/**/*.json`.
     pub fn load(data: &Path) -> Tree {
+        Self::load_with(data, &horizon_world::loot::PackOverlay::NONE)
+    }
+    /// The tree with a world's data packs' advancement files over the game's
+    /// own: the top pack's file for each id replaces it.
+    pub fn load_with(data: &Path, overlay: &horizon_world::loot::PackOverlay) -> Tree {
         let mut tree = Tree::default();
         let Ok(namespaces) = std::fs::read_dir(data) else {
             return tree;
         };
-        let mut files = Vec::new();
+        // One JSON per id, the packs' over the game's own. Through `json_folder`: from
+        // the prepared data file, and read once while a load holds the folder.
+        let mut json: BTreeMap<String, Value> = BTreeMap::new();
         for ns in namespaces.flatten() {
-            let root = ns.path().join("advancement");
-            collect(&root, &root, &ns.file_name().to_string_lossy(), &mut files);
+            let Ok(folder) = horizon_world::json_folder::read(&ns.path().join("advancement"))
+            else {
+                continue;
+            };
+            let ns = ns.file_name().to_string_lossy().into_owned();
+            for file in &folder.files {
+                if let Ok(v) = serde_json::from_slice::<Value>(file.bytes().unwrap_or_default()) {
+                    json.insert(format!("{ns}:{}", file.name), v);
+                }
+            }
         }
-        files.sort();
-        for (id, path) in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
+        for (id, files) in overlay.kind("advancement") {
+            match serde_json::from_slice::<Value>(horizon_world::loot::PackOverlay::top(files)) {
+                Ok(v) => {
+                    json.insert(id.to_owned(), v);
+                }
+                Err(e) => log::warn!("Horizon: pack advancement {id} not loaded: {e}"),
+            }
+        }
+        for (id, v) in json {
             if let Some(a) = parse(&id, &v) {
                 let index = tree.list.len();
                 for (ci, c) in a.criteria.iter().enumerate() {
@@ -93,25 +140,111 @@ impl Tree {
                 tree.list.push(a);
             }
         }
+        tree.index_recipes();
         tree
+    }
+    /// Index the `recipe_unlocked` criteria by recipe: a grant that unlocks
+    /// twenty recipes tested every one of the ~1,300 recipe advancements'
+    /// criteria for each (several ms in one tick).
+    pub fn index_recipes(&mut self) {
+        self.by_recipe.clear();
+        self.recipes_any.clear();
+        for &(ai, ci) in self
+            .by_trigger
+            .get("minecraft:recipe_unlocked")
+            .into_iter()
+            .flatten()
+        {
+            // `read`: the index alone keeps none of the criteria read.
+            match self.list[ai].criteria[ci].conditions.read()["recipes"].as_str() {
+                Some(r) => self
+                    .by_recipe
+                    .entry(r.to_owned())
+                    .or_default()
+                    .push((ai, ci)),
+                None => self.recipes_any.push((ai, ci)),
+            }
+        }
+    }
+    /// The `recipe_unlocked` criteria that could pass for `recipe`, in tree
+    /// order (the others name another recipe).
+    pub fn recipe_criteria(&self, recipe: &str) -> Vec<(usize, usize)> {
+        let mut out = self.recipes_any.clone();
+        out.extend(self.by_recipe.get(recipe).into_iter().flatten());
+        out.sort_unstable();
+        out
     }
     pub fn get(&self, id: &str) -> Option<&Advancement> {
         self.by_id.get(id).map(|&i| &self.list[i])
     }
 }
-fn collect(root: &Path, dir: &Path, ns: &str, out: &mut Vec<(String, std::path::PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect(root, &p, ns, out);
-        } else if p.extension().is_some_and(|x| x == "json") {
-            let rel = p.strip_prefix(root).unwrap_or(&p).with_extension("");
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            out.push((format!("{ns}:{rel}"), p));
+
+/// The `inventory_changed` criteria by the items they need. A criterion whose
+/// item predicates include one limited to some items (an id, a `#tag`, a
+/// list) can only pass with one of those in the inventory, so an inventory
+/// change tests only the criteria of the items it holds, plus those that
+/// need no particular item. The same answers as testing them all: the ~1,300
+/// recipe advancements each have one, and testing every one of them cost a
+/// player 1–4 ms on every tick its inventory changed.
+#[derive(Default)]
+pub struct InventoryIndex {
+    by_item: HashMap<String, Vec<(usize, usize)>>,
+    any: Vec<(usize, usize)>,
+}
+impl InventoryIndex {
+    /// `tag` gives a `#tag`'s item ids (none for a tag that doesn't exist,
+    /// which matches nothing).
+    pub fn build<'t>(tree: &Tree, tag: impl Fn(&str) -> Vec<&'t str>) -> Self {
+        fn ids<'t>(v: &Value, tag: &impl Fn(&str) -> Vec<&'t str>, out: &mut Vec<String>) {
+            match v {
+                Value::String(s) => match s.strip_prefix('#') {
+                    Some(t) => out.extend(tag(t).into_iter().map(str::to_owned)),
+                    None => out.push(s.clone()),
+                },
+                Value::Array(a) => a.iter().for_each(|x| ids(x, tag, out)),
+                _ => {}
+            }
         }
+        let mut index = Self::default();
+        let Some(list) = tree.by_trigger.get("minecraft:inventory_changed") else {
+            return index;
+        };
+        for &(ai, ci) in list {
+            let conditions = tree.list[ai].criteria[ci].conditions.read();
+            let items = &conditions["items"];
+            // `id_matches`: only a string or a list limits the items.
+            let limited = items.as_array().and_then(|a| {
+                a.iter()
+                    .map(|p| &p["items"])
+                    .find(|v| v.is_string() || v.is_array())
+            });
+            match limited {
+                Some(v) => {
+                    let mut out = Vec::new();
+                    ids(v, &tag, &mut out);
+                    out.sort();
+                    out.dedup();
+                    for id in out {
+                        index.by_item.entry(id).or_default().push((ai, ci));
+                    }
+                }
+                None => index.any.push((ai, ci)),
+            }
+        }
+        index
+    }
+    /// The criteria an inventory holding these item ids could pass, in
+    /// tree order.
+    pub fn candidates<'a>(&self, held: impl IntoIterator<Item = &'a str>) -> Vec<(usize, usize)> {
+        let mut out = self.any.clone();
+        for id in held {
+            if let Some(list) = self.by_item.get(id) {
+                out.extend_from_slice(list);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 fn parse(id: &str, v: &Value) -> Option<Advancement> {
@@ -121,7 +254,7 @@ fn parse(id: &str, v: &Value) -> Option<Advancement> {
         .map(|(name, c)| Criterion {
             name: name.clone(),
             trigger: c["trigger"].as_str().unwrap_or("").to_owned(),
-            conditions: c["conditions"].clone(),
+            conditions: LazyJson::new(&c["conditions"]),
         })
         .collect();
     let requirements = match v["requirements"].as_array() {
@@ -334,11 +467,20 @@ pub struct EntityView {
     /// mainhand, offhand, head, chest, legs, feet, body.
     pub equipment: [Option<ItemView>; 7],
     pub vehicle: Option<Box<EntityView>>,
+    /// `Entity.getPassengers`, for `PassengerPredicate`.
+    pub passengers: Vec<EntityView>,
+    /// Player: what it looks at within 100 blocks (`PlayerPredicate.lookingAt`).
+    pub looking_at: Option<Box<EntityView>>,
     pub effects: Vec<(String, i32, i32)>,
     /// Player: game mode name.
     pub gamemode: Option<String>,
+    /// Player: the sneak input is held (`Input.shift`, what `input.sneak`
+    /// asks; not the sneaking pose).
+    pub input_sneak: bool,
     /// Lightning: entities it struck.
     pub struck: Vec<EntityView>,
+    /// Lightning: blocks it set on fire (`LightningBolt.blocksSetOnFire`).
+    pub blocks_set_on_fire: i32,
     pub fishing_open_water: Option<bool>,
     pub variant: Option<String>,
     /// The data components the entity reports (`Entity.get`): id and value.
@@ -355,7 +497,7 @@ fn range_f(v: &Value, x: f64) -> bool {
         _ => false,
     }
 }
-fn range_i(v: &Value, x: i64) -> bool {
+pub fn range_i(v: &Value, x: i64) -> bool {
     range_f(v, x as f64)
 }
 /// A registry id, `#tag`, or list matched against one id.
@@ -369,6 +511,51 @@ pub fn id_matches(v: &Value, registry: &str, id: &str, w: &dyn World) -> bool {
         Value::Array(a) => a.iter().any(|x| id_matches(x, registry, id, w)),
         _ => false,
     }
+}
+/// `PotionsPredicate`: the potion in a `HolderSet`, plus a `CollectionPredicate`
+/// over the potion's effects (`contains`, `count`, `size`).
+pub fn potions(v: &Value, potion: Option<&str>, w: &dyn World) -> bool {
+    if v.is_null() {
+        return true;
+    }
+    if !v["potions"].is_null() && !potion.is_some_and(|p| id_matches(&v["potions"], "potion", p, w))
+    {
+        return false;
+    }
+    let c = &v["effects"];
+    if c.is_null() {
+        return true;
+    }
+    let effects: Vec<(String, i32, i32)> = potion
+        .and_then(crate::brewing::potion)
+        .map(|d| {
+            d.effects
+                .iter()
+                .map(|(id, dur, amp)| (format!("minecraft:{id}"), *amp, *dur))
+                .collect()
+        })
+        .unwrap_or_default();
+    // `MobEffectsPredicate.test`: the one listed effect, amplifier and duration.
+    let test = |pred: &Value, e: &(String, i32, i32)| {
+        pred.as_object().is_some_and(|m| {
+            m.get(&e.0).is_some_and(|want| {
+                range_i(&want["amplifier"], i64::from(e.1))
+                    && range_i(&want["duration"], i64::from(e.2))
+                    && want["ambient"].as_bool().is_none_or(|b| !b)
+                    && want["visible"].as_bool().is_none_or(|b| b)
+            })
+        })
+    };
+    c["contains"]
+        .as_array()
+        .is_none_or(|l| l.iter().all(|p| effects.iter().any(|e| test(p, e))))
+        && c["count"].as_array().is_none_or(|l| {
+            l.iter().all(|entry| {
+                let n = effects.iter().filter(|e| test(&entry["test"], e)).count();
+                range_i(&entry["count"], n as i64)
+            })
+        })
+        && range_i(&c["size"], effects.len() as i64)
 }
 /// `ItemPredicate`.
 pub fn item(v: &Value, it: &ItemView, w: &dyn World) -> bool {
@@ -385,6 +572,11 @@ pub fn item(v: &Value, it: &ItemView, w: &dyn World) -> bool {
     let comps = &v["components"];
     if let Some(p) = comps["minecraft:potion_contents"].as_str()
         && it.potion.as_deref() != Some(p)
+    {
+        return false;
+    }
+    if let Some(d) = comps["minecraft:damage"].as_u64()
+        && u64::from(it.damage) != d
     {
         return false;
     }
@@ -407,6 +599,19 @@ pub fn item(v: &Value, it: &ItemView, w: &dyn World) -> bool {
         }
     }
     true
+}
+/// `LockCode.canUnlock`: a spectator opens any container; otherwise the
+/// player's main hand must match the lock's `ItemPredicate`. An empty hand
+/// holds nothing to match (`getMainHandItem` is `ItemStack.EMPTY`), while
+/// `LockCode.NO_LOCK`'s empty predicate takes any stack.
+pub fn can_unlock(
+    lock: &Value,
+    spectator: bool,
+    main_hand: Option<&ItemView>,
+    w: &dyn World,
+) -> bool {
+    let empty = ItemView::default();
+    spectator || item(lock, main_hand.unwrap_or(&empty), w)
 }
 /// `BlockPredicate`.
 pub fn block(v: &Value, pos: [i32; 3], w: &dyn World) -> bool {
@@ -511,6 +716,18 @@ fn components(expected: &Value, have: &[(String, String)]) -> bool {
         })
     })
 }
+/// `DistancePredicate.matches` between two points.
+pub fn distance(v: &Value, a: [f64; 3], b: [f64; 3]) -> bool {
+    let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    range_f(&v["x"], d[0].abs())
+        && range_f(&v["y"], d[1].abs())
+        && range_f(&v["z"], d[2].abs())
+        && range_f(&v["horizontal"], (d[0] * d[0] + d[2] * d[2]).sqrt())
+        && range_f(
+            &v["absolute"],
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt(),
+        )
+}
 /// `EntityPredicate` (26.x keyed sub-predicates).
 pub fn entity(v: &Value, e: &EntityView, w: &dyn World, origin: [f64; 3]) -> bool {
     if v.is_null() {
@@ -526,21 +743,7 @@ pub fn entity(v: &Value, e: &EntityView, w: &dyn World, origin: [f64; 3]) -> boo
             "minecraft:stepping_on" => {
                 location(p, [e.position[0], e.position[1] - 0.5, e.position[2]], w)
             }
-            "minecraft:distance" | "distance" => {
-                let d = [
-                    e.position[0] - origin[0],
-                    e.position[1] - origin[1],
-                    e.position[2] - origin[2],
-                ];
-                range_f(&p["x"], d[0].abs())
-                    && range_f(&p["y"], d[1].abs())
-                    && range_f(&p["z"], d[2].abs())
-                    && range_f(&p["horizontal"], (d[0] * d[0] + d[2] * d[2]).sqrt())
-                    && range_f(
-                        &p["absolute"],
-                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt(),
-                    )
-            }
+            "minecraft:distance" | "distance" => distance(p, e.position, origin),
             "minecraft:flags" | "flags" => {
                 let f = |k: &str, have: bool| p[k].as_bool().is_none_or(|want| want == have);
                 f("is_on_fire", e.on_fire)
@@ -566,6 +769,11 @@ pub fn entity(v: &Value, e: &EntityView, w: &dyn World, origin: [f64; 3]) -> boo
                 .vehicle
                 .as_ref()
                 .is_some_and(|veh| entity(p, veh, w, origin)),
+            // PassengerPredicate.matches: any passenger matches the nested predicate.
+            "minecraft:passenger" | "passenger" => e
+                .passengers
+                .iter()
+                .any(|passenger| entity(p, passenger, w, origin)),
             "minecraft:effects" | "effects" => p.as_object().is_some_and(|m| {
                 m.iter().all(|(id, want)| {
                     e.effects.iter().any(|(eid, amp, dur)| {
@@ -575,13 +783,23 @@ pub fn entity(v: &Value, e: &EntityView, w: &dyn World, origin: [f64; 3]) -> boo
                     })
                 })
             }),
-            "minecraft:type_specific/player" => p["gamemode"].as_array().is_none_or(|modes| {
-                e.gamemode
-                    .as_deref()
-                    .is_some_and(|g| modes.iter().any(|m| m.as_str() == Some(g)))
-            }),
+            "minecraft:type_specific/player" => {
+                // `PlayerPredicate.matches`: `instanceof ServerPlayer` first,
+                // then the game mode, what it looks at and its `input`.
+                e.kind == "minecraft:player"
+                    && p["gamemode"].as_array().is_none_or(|modes| {
+                        e.gamemode
+                            .as_deref()
+                            .is_some_and(|g| modes.iter().any(|m| m.as_str() == Some(g)))
+                    })
+                    && (p["looking_at"].is_null()
+                        || e.looking_at
+                            .as_ref()
+                            .is_some_and(|t| entity(&p["looking_at"], t, w, origin)))
+                    && (p["input"].is_null() || input(&p["input"], e))
+            }
             "minecraft:type_specific/lightning" => {
-                range_i(&p["blocks_set_on_fire"], 0)
+                range_i(&p["blocks_set_on_fire"], i64::from(e.blocks_set_on_fire))
                     && (p["entity_struck"].is_null()
                         || e.struck
                             .iter()
@@ -599,6 +817,101 @@ pub fn entity(v: &Value, e: &EntityView, w: &dyn World, origin: [f64; 3]) -> boo
         }
     }
     true
+}
+/// `InputPredicate.matches`: the player's held inputs. The sneak input is
+/// what the game holds; the other inputs have no source here yet and count
+/// as unconstrained.
+fn input(p: &Value, e: &EntityView) -> bool {
+    p["sneak"]
+        .as_bool()
+        .is_none_or(|want| want == e.input_sneak)
+}
+/// `KilledByArrowTrigger.TriggerInstance.matches`: the weapon, each listed
+/// victim condition matched by a distinct victim, and the count of entity types.
+pub fn killed_by_arrow(
+    c: &Value,
+    me: &EntityView,
+    victims: &[EntityView],
+    weapon: Option<&ItemView>,
+    w: &dyn World,
+) -> bool {
+    fn ctx<'a>(e: &'a EntityView, me: &EntityView) -> Entities<'a> {
+        Entities {
+            this: Some(e),
+            origin: me.position,
+            tool: None,
+            block_pos: None,
+        }
+    }
+    if !conditions(&c["player"], &ctx(me, me), w) {
+        return false;
+    }
+    if !c["fired_from_weapon"].is_null()
+        && !weapon.is_some_and(|it| item(&c["fired_from_weapon"], it, w))
+    {
+        return false;
+    }
+    let mut left: Vec<&EntityView> = victims.iter().collect();
+    for want in c["victims"].as_array().into_iter().flatten() {
+        let Some(i) = left.iter().position(|e| conditions(want, &ctx(e, me), w)) else {
+            return false;
+        };
+        left.remove(i);
+    }
+    let kinds: BTreeSet<&str> = victims.iter().map(|e| e.kind.as_str()).collect();
+    range_i(&c["unique_entity_types"], kinds.len() as i64)
+}
+/// A damage event as `DamagePredicate` sees it.
+#[derive(Clone, Debug, Default)]
+pub struct DamageView {
+    /// The damage type id (`minecraft:arrow`).
+    pub kind: String,
+    /// `DamageSource.getDirectEntity` and `getEntity`.
+    pub direct: Option<EntityView>,
+    pub source: Option<EntityView>,
+    /// `DamageSource.isDirect`: the direct entity is the causing one.
+    pub is_direct: bool,
+    /// The damage before and after the shield took its share.
+    pub original: f32,
+    pub actual: f32,
+    pub blocked: bool,
+}
+/// `DamagePredicate`, with its `DamageSourcePredicate` as `type`.
+pub fn damage(v: &Value, d: &DamageView, w: &dyn World, origin: [f64; 3]) -> bool {
+    if v.is_null() {
+        return true;
+    }
+    let by = |key: &str, e: &Option<EntityView>| {
+        v[key].is_null() || e.as_ref().is_some_and(|e| entity(&v[key], e, w, origin))
+    };
+    if !range_f(&v["dealt"], f64::from(d.original))
+        || !range_f(&v["taken"], f64::from(d.actual))
+        || !by("source_entity", &d.source)
+        || v["blocked"].as_bool().is_some_and(|b| b != d.blocked)
+    {
+        return false;
+    }
+    damage_source(&v["type"], d, w, origin)
+}
+/// `DamageSourcePredicate`: the damage type's tags and the entities behind it.
+pub fn damage_source(ty: &Value, d: &DamageView, w: &dyn World, origin: [f64; 3]) -> bool {
+    if ty.is_null() {
+        return true;
+    }
+    let tags_ok = ty["tags"].as_array().into_iter().flatten().all(|t| {
+        let tag = t["id"].as_str().unwrap_or("");
+        let tag = tag.strip_prefix('#').unwrap_or(tag);
+        w.in_tag("damage_type", tag, &d.kind) == t["expected"].as_bool().unwrap_or(true)
+    });
+    let direct_ok = ty["direct_entity"].is_null()
+        || d.direct
+            .as_ref()
+            .is_some_and(|e| entity(&ty["direct_entity"], e, w, origin));
+    let source_ok = ty["source_entity"].is_null()
+        || d.source
+            .as_ref()
+            .is_some_and(|e| entity(&ty["source_entity"], e, w, origin));
+    tags_ok && direct_ok && source_ok && ty["is_direct"].as_bool().is_none_or(|b| b == d.is_direct)
 }
 /// The entities a loot-style condition list may refer to.
 pub struct Entities<'a> {
@@ -628,6 +941,22 @@ pub fn item_entity(
     conditions(&v["player"], &pctx, w)
         && conditions(&v["entity"], &ectx, w)
         && item(&v["item"], stack, w)
+}
+
+/// `RecipeCraftedTrigger.TriggerInstance.matches`: each ingredient predicate
+/// takes a different one of the stacks used, in order.
+pub fn recipe_ingredients(v: &Value, used: &[ItemView], w: &dyn World) -> bool {
+    let Some(preds) = v.as_array() else {
+        return true;
+    };
+    let mut remaining: Vec<&ItemView> = used.iter().collect();
+    preds.iter().all(|p| {
+        let Some(i) = remaining.iter().position(|it| item(p, it, w)) else {
+            return false;
+        };
+        remaining.remove(i);
+        true
+    })
 }
 
 /// A `ContextAwarePredicate`: a list of loot conditions (or one condition).
@@ -992,6 +1321,77 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The criteria an inventory change and a recipe unlock test, on vanilla's tree:
+    /// `cargo test -p horizon-client --lib -- --ignored --nocapture index_on_vanilla_tree`
+    /// with HORIZON_RESOURCES set to the prepared resources.
+    #[test]
+    #[ignore = "needs the prepared resources"]
+    fn index_on_vanilla_tree() {
+        let Some(root) = std::env::var_os("HORIZON_RESOURCES").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let data = root.join("data");
+        let t = std::time::Instant::now();
+        let tree = Tree::load(&data);
+        let load = t.elapsed();
+        let tags = data.join("minecraft/tags/item");
+        let tag_items: HashMap<String, Vec<String>> = std::fs::read_dir(&tags)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let v: Value =
+                    serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+                let name = format!("minecraft:{}", e.path().file_stem()?.to_string_lossy());
+                let values = v["values"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned));
+                Some((name, values.collect()))
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let index = InventoryIndex::build(&tree, |tag| {
+            tag_items
+                .get(tag)
+                .map(|v| v.iter().map(String::as_str).collect())
+                .unwrap_or_default()
+        });
+        let build = t.elapsed();
+        let all = tree
+            .by_trigger
+            .get("minecraft:inventory_changed")
+            .map_or(0, Vec::len);
+        let held = [
+            "minecraft:iron_ingot",
+            "minecraft:oak_log",
+            "minecraft:cobblestone",
+            "minecraft:diamond_pickaxe",
+            "minecraft:bread",
+            "minecraft:torch",
+            "minecraft:oak_planks",
+            "minecraft:stick",
+            "minecraft:coal",
+        ];
+        let t = std::time::Instant::now();
+        let mut candidates = 0;
+        for _ in 0..1000 {
+            candidates = index.candidates(held).len();
+        }
+        let per_change = t.elapsed() / 1000;
+        let recipes = tree
+            .by_trigger
+            .get("minecraft:recipe_unlocked")
+            .map_or(0, Vec::len);
+        let per_recipe = tree.recipe_criteria("minecraft:iron_pickaxe").len();
+        eprintln!(
+            "tree {load:?}; inventory_changed: {all} criteria, index built in {build:?}, \
+             a 9-stack inventory tests {candidates} (looked up in {per_change:?}); \
+             recipe_unlocked: {recipes} criteria, iron_pickaxe tests {per_recipe}"
+        );
+        assert!(candidates < all / 10);
+    }
     struct Flat;
     impl World for Flat {
         fn dimension(&self) -> &str {
@@ -1021,7 +1421,113 @@ mod tests {
         fn in_tag(&self, _: &str, tag: &str, id: &str) -> bool {
             (tag == "minecraft:stone_tool_materials" && id == "minecraft:cobblestone")
                 || (tag == "minecraft:sulfur_cube_archetype/explosive" && id == "minecraft:tnt")
+                || (tag == "minecraft:is_projectile"
+                    && matches!(id, "minecraft:fireball" | "minecraft:arrow"))
         }
+    }
+    /// A `recipe_crafted` criterion names `minecraft:x`; the craft hands
+    /// the recipe book and the trigger the same whole id (`award_crafted`
+    /// qualifies). The bare name the crafting copy uses never matched —
+    /// the second half of #7186.
+    #[test]
+    fn a_recipe_crafted_criterion_matches_the_whole_id_only() {
+        let w = Flat;
+        let criterion = serde_json::json!({"recipes": "minecraft:folder_recipe"});
+        assert!(
+            !id_matches(&criterion["recipes"], "recipe", "folder_recipe", &w),
+            "the crafting copy's bare name never matched the criterion"
+        );
+        assert!(
+            id_matches(
+                &criterion["recipes"],
+                "recipe",
+                &crate::crafting::qualified("folder_recipe"),
+                &w
+            ),
+            "the whole id award_crafted passes matches"
+        );
+    }
+
+    /// `LockCode.canUnlock` for a chest with
+    /// `lock:{items:"minecraft:gold_ingot"}`: a gold ingot opens it, an empty
+    /// hand or another item does not, and a spectator always does.
+    #[test]
+    fn a_lock_takes_its_item_and_any_spectator() {
+        let lock = serde_json::json!({"items": "minecraft:gold_ingot"});
+        let gold = ItemView {
+            id: "minecraft:gold_ingot".into(),
+            count: 1,
+            ..Default::default()
+        };
+        let stick = ItemView {
+            id: "minecraft:stick".into(),
+            count: 1,
+            ..Default::default()
+        };
+        assert!(can_unlock(&lock, false, Some(&gold), &Flat));
+        assert!(!can_unlock(&lock, false, Some(&stick), &Flat));
+        assert!(!can_unlock(&lock, false, None, &Flat));
+        assert!(can_unlock(&lock, true, None, &Flat));
+        assert!(can_unlock(&lock, true, Some(&stick), &Flat));
+        // `LockCode.NO_LOCK` is the empty predicate: it takes any stack, and
+        // `unlocksWith(EMPTY)` too.
+        let none = serde_json::json!({});
+        assert!(can_unlock(&none, false, None, &Flat));
+    }
+    /// `PassengerPredicate.matches`: ride_a_boat_with_a_goat's vehicle holds a goat.
+    #[test]
+    fn passenger_predicate_needs_a_matching_passenger() {
+        let want = serde_json::json!({
+            "minecraft:entity_type": "minecraft:oak_boat",
+            "minecraft:passenger": {"minecraft:entity_type": "minecraft:goat"}
+        });
+        let entity = |kind: &str| EntityView {
+            kind: kind.into(),
+            ..Default::default()
+        };
+        let mut boat = entity("minecraft:oak_boat");
+        assert!(!super::entity(&want, &boat, &Flat, [0.0; 3]));
+        boat.passengers = vec![entity("minecraft:player")];
+        assert!(!super::entity(&want, &boat, &Flat, [0.0; 3]));
+        boat.passengers.push(entity("minecraft:goat"));
+        assert!(super::entity(&want, &boat, &Flat, [0.0; 3]));
+    }
+    /// Return to Sender's `killing_blow`: only the ghast's own fireball, as a
+    /// projectile, kills it for the advancement; a sword or an arrow does not.
+    #[test]
+    fn killing_blow_needs_the_fireball() {
+        let blow = serde_json::json!({
+            "direct_entity": {"minecraft:entity_type": "minecraft:fireball"},
+            "tags": [{"expected": true, "id": "#minecraft:is_projectile"}]
+        });
+        let entity = |kind: &str| EntityView {
+            kind: kind.into(),
+            ..Default::default()
+        };
+        let player = entity("minecraft:player");
+        let fireball = DamageView {
+            kind: "minecraft:fireball".into(),
+            direct: Some(entity("minecraft:fireball")),
+            source: Some(player.clone()),
+            ..Default::default()
+        };
+        assert!(damage_source(&blow, &fireball, &Flat, [0.0; 3]));
+        let sword = DamageView {
+            kind: "minecraft:player_attack".into(),
+            direct: Some(player.clone()),
+            source: Some(player.clone()),
+            is_direct: true,
+            ..Default::default()
+        };
+        assert!(!damage_source(&blow, &sword, &Flat, [0.0; 3]));
+        let arrow = DamageView {
+            kind: "minecraft:arrow".into(),
+            direct: Some(entity("minecraft:arrow")),
+            source: Some(player),
+            ..Default::default()
+        };
+        assert!(!damage_source(&blow, &arrow, &Flat, [0.0; 3]));
+        assert!(damage_source(&Value::Null, &sword, &Flat, [0.0; 3]));
     }
     #[test]
     fn uh_oh_accepts_either_tnt_event_only_for_adult_sulfur_cubes() {
@@ -1089,6 +1595,94 @@ mod tests {
             ));
             stack.id = "minecraft:tnt".into();
         }
+    }
+    /// Only the criteria the held items could pass are tested; those that
+    /// need no particular item always are.
+    #[test]
+    fn inventory_index_keeps_the_criteria_the_items_could_pass() {
+        let criteria = [
+            serde_json::json!({"items": [{"items": "minecraft:diamond"}]}),
+            serde_json::json!({"items": [{"items": "#minecraft:planks"}]}),
+            serde_json::json!({"items": [{"count": {"min": 2}}]}),
+            serde_json::json!({"items": [{"count": 1}, {"items": ["minecraft:stick", "minecraft:apple"]}]}),
+            serde_json::json!({"slots": {"empty": 0}}),
+            serde_json::json!({"items": [{"items": "#minecraft:no_such_tag"}]}),
+        ];
+        let mut tree = Tree::default();
+        for (i, conditions) in criteria.into_iter().enumerate() {
+            tree.list.push(Advancement {
+                id: format!("test:{i}"),
+                parent: None,
+                display: None,
+                criteria: vec![Criterion {
+                    name: "c".into(),
+                    trigger: "minecraft:inventory_changed".into(),
+                    conditions: LazyJson::new(&conditions),
+                }],
+                requirements: vec![vec!["c".into()]],
+                rewards: Rewards::default(),
+            });
+            tree.by_trigger
+                .entry("minecraft:inventory_changed".into())
+                .or_default()
+                .push((i, 0));
+        }
+        let index = InventoryIndex::build(&tree, |tag| match tag {
+            "minecraft:planks" => vec!["minecraft:oak_planks", "minecraft:birch_planks"],
+            _ => Vec::new(),
+        });
+        let found = |held: &[&str]| -> Vec<usize> {
+            index
+                .candidates(held.iter().copied())
+                .into_iter()
+                .map(|(ai, _)| ai)
+                .collect()
+        };
+        assert_eq!(found(&[]), [2, 4]);
+        assert_eq!(found(&["minecraft:dirt"]), [2, 4]);
+        assert_eq!(
+            found(&["minecraft:oak_planks", "minecraft:diamond"]),
+            [0, 1, 2, 4]
+        );
+        assert_eq!(found(&["minecraft:apple", "minecraft:apple"]), [2, 3, 4]);
+    }
+    /// A recipe unlocked tests only the criteria that name it.
+    #[test]
+    fn recipe_index_keeps_the_criteria_of_the_recipe() {
+        let mut tree = Tree::default();
+        for (i, conditions) in [
+            serde_json::json!({"recipes": "minecraft:oak_planks"}),
+            serde_json::json!({"recipes": "minecraft:stick"}),
+            serde_json::json!({}),
+            serde_json::json!({"recipes": "minecraft:oak_planks"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tree.list.push(Advancement {
+                id: format!("test:{i}"),
+                parent: None,
+                display: None,
+                criteria: vec![Criterion {
+                    name: "c".into(),
+                    trigger: "minecraft:recipe_unlocked".into(),
+                    conditions: LazyJson::new(&conditions),
+                }],
+                requirements: vec![vec!["c".into()]],
+                rewards: Rewards::default(),
+            });
+            tree.by_trigger
+                .entry("minecraft:recipe_unlocked".into())
+                .or_default()
+                .push((i, 0));
+        }
+        tree.index_recipes();
+        assert_eq!(
+            tree.recipe_criteria("minecraft:oak_planks"),
+            [(0, 0), (2, 0), (3, 0)]
+        );
+        assert_eq!(tree.recipe_criteria("minecraft:stick"), [(1, 0), (2, 0)]);
+        assert_eq!(tree.recipe_criteria("minecraft:torch"), [(2, 0)]);
     }
     #[test]
     fn bucket_axolotl_block_advancements_require_the_placed_block() {

@@ -21,6 +21,7 @@
 .DS_Store
 # What the client writes to its working directory when run from the repo root.
 /options.txt
+/debug-profile.json
 /horizon.txt
 /horizon-graphics.txt
 /horizon-controller.txt
@@ -36,3 +37,6 @@
 /android/build/
 /android/native/target/
 /android/native/Cargo.lock
+
+# Release-only compiled original exporter bundle.
+/exporters/

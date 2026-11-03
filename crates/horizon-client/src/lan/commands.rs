@@ -84,8 +84,39 @@ impl CommandTree {
         })
     }
 
+    /// Whether vanilla has a command of this name.
+    pub fn has(&self, name: &str) -> bool {
+        self.root["children"].get(name).is_some()
+    }
+
     /// The ClientboundCommandsPacket for a player with `level` permissions.
     pub fn packet(&self, level: u8, dedicated: bool, builtin: &Builtin) -> Commands {
+        self.packet_with(level, dedicated, builtin, &Value::Null)
+    }
+
+    /// [`CommandTree::packet`] with more commands after vanilla's: `extra`
+    /// is a root in the report's format (server mods' commands).
+    pub fn packet_with(
+        &self,
+        level: u8,
+        dedicated: bool,
+        builtin: &Builtin,
+        extra: &Value,
+    ) -> Commands {
+        self.packet_with_features(level, dedicated, builtin, extra, &[])
+    }
+
+    pub fn packet_with_features(
+        &self,
+        level: u8,
+        dedicated: bool,
+        builtin: &Builtin,
+        extra: &Value,
+        features: &[String],
+    ) -> Commands {
+        let minecart_improvements = features
+            .iter()
+            .any(|f| f == crate::gamerules::MINECART_IMPROVEMENTS);
         let mut nodes = vec![Node {
             name: String::new(),
             kind: 0,
@@ -99,16 +130,19 @@ impl CommandTree {
         let suggestions: HashMap<&str, &'static str> = SUGGESTIONS.iter().copied().collect();
         let mut paths: HashMap<Vec<String>, usize> = HashMap::new();
         paths.insert(Vec::new(), 0);
-        fill(
-            &self.root,
-            0,
-            &mut Vec::new(),
-            level,
-            dedicated,
-            &suggestions,
-            &mut nodes,
-            &mut paths,
-        );
+        for root in [&self.root, extra] {
+            fill(
+                root,
+                0,
+                &mut Vec::new(),
+                level,
+                dedicated,
+                minecart_improvements,
+                &suggestions,
+                &mut nodes,
+                &mut paths,
+            );
+        }
         // enumerateNodes: breadth first from the root, each node's children
         // (in registration order) then its redirect target.
         let mut ids = vec![None; nodes.len()];
@@ -164,6 +198,7 @@ fn fill(
     path: &mut Vec<String>,
     level: u8,
     dedicated: bool,
+    minecart_improvements: bool,
     suggestions: &HashMap<&str, &'static str>,
     nodes: &mut Vec<Node>,
     paths: &mut HashMap<Vec<String>, usize>,
@@ -196,6 +231,7 @@ fn fill(
         if required > level
             || path.len() == 1
                 && path[0] == "gamerule"
+                && !minecart_improvements
                 && EXPERIMENTAL_RULES.contains(&name.as_str())
         {
             continue;
@@ -236,6 +272,7 @@ fn fill(
             path,
             level,
             dedicated,
+            minecart_improvements,
             suggestions,
             nodes,
             paths,
@@ -364,5 +401,34 @@ mod tests {
             ["", "me", "tell", "say", "stop", "action", "message"]
         );
         assert!(op.nodes[3].restricted);
+    }
+
+    #[test]
+    fn server_mods_commands_follow_vanillas() {
+        let report: Value = serde_json::from_str(
+            r#"{"type":"root","children":{"me":{"type":"literal","children":{"action":{"type":"argument","parser":"minecraft:message","executable":true}}}}}"#,
+        )
+        .unwrap();
+        let mods: Value = serde_json::from_str(
+            r#"{"type":"root","children":{"beacon":{"type":"literal","executable":true,"children":{
+                "height":{"type":"argument","parser":"brigadier:integer","properties":{"min":1,"max":64},"executable":true}}}}}"#,
+        )
+        .unwrap();
+        let tree = CommandTree { root: report };
+        let packet = tree.packet_with(0, true, &Builtin::default(), &mods);
+        let names: Vec<_> = packet.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["", "me", "beacon", "action", "height"]);
+        let beacon = &packet.nodes[2];
+        assert!(beacon.executable && !beacon.restricted);
+        assert_eq!(beacon.children, [4]);
+        let height = packet.nodes[4].parser.as_ref().unwrap();
+        assert_eq!(height.1, vec![3, 0, 0, 0, 1, 0, 0, 0, 64]);
+        // No mods: vanilla's tree as it is.
+        assert_eq!(
+            tree.packet_with(0, true, &Builtin::default(), &Value::Null)
+                .nodes
+                .len(),
+            3
+        );
     }
 }

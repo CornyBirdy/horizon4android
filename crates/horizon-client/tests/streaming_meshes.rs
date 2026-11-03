@@ -4,11 +4,13 @@
 //! came closer, so they stayed invisible until a block in them changed.
 //! Relit columns remesh only where their light changed (#270), and every
 //! mesh still matches the world.
+extern crate horizon_client_lib as horizon_client;
 use horizon_client::{
     assets::Assets,
     biome::Biomes,
     blocks::BlockFacts,
     chunk::{Chunk, HEIGHT},
+    graphics::LeafCullingMode,
     light::LightTables,
     mesher::{MeshTables, Mesher, Region, SectionMesh, borrow},
     models,
@@ -26,7 +28,9 @@ use std::{
 };
 
 fn resources() -> Option<std::path::PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.local/horizon-client")
+        .join(horizon_core::VANILLA_VERSION);
     root.join("items.json").exists().then_some(root)
 }
 
@@ -77,9 +81,12 @@ fn columns_loaded_past_the_render_distance_mesh_when_they_come_in_range() {
             assert!(Instant::now() < deadline, "streaming never settled");
             let before = (world.chunks.len(), meshed.len());
             let (uploads, _) = streaming.update(&mut world);
-            meshed.extend(uploads.into_iter().map(|(key, _)| key));
+            meshed.extend(uploads.iter().map(|(key, _)| *key));
+            // As the game does once they are uploaded: a worker frees them,
+            // and nothing comes back (`pending` empties).
+            streaming.free(uploads);
             thread::sleep(Duration::from_millis(5));
-            let idle = streaming.pending() == 0 && before == (world.chunks.len(), meshed.len());
+            let idle = !streaming.busy() && before == (world.chunks.len(), meshed.len());
             quiet = if idle { quiet + 1 } else { 0 };
         }
     };
@@ -174,7 +181,7 @@ fn relit_columns_keep_every_mesh_current() {
         while quiet < 40 {
             assert!(Instant::now() < deadline, "streaming never settled");
             let (uploads, _) = streaming.update(world);
-            let idle = uploads.is_empty() && streaming.pending() == 0;
+            let idle = uploads.is_empty() && !streaming.busy();
             meshes.extend(uploads);
             thread::sleep(Duration::from_millis(5));
             quiet = if idle { quiet + 1 } else { 0 };
@@ -209,18 +216,23 @@ fn relit_columns_keep_every_mesh_current() {
         });
         let mut mesher = Mesher {
             nether_shading: false,
+            shader_pack_lighting: false,
+            separate_ao: false,
             zoom: BiomeZoom::new(0),
             blend_radius: 2,
             smooth_lighting: true,
             cutout_leaves: true,
-            cull_leaves: false,
+            translucent_layers: &[],
+            leaf_culling: LeafCullingMode::Off,
             assets: &context.assets,
             render: &context.render,
             tables: &context.tables,
             biomes: &context.biomes,
             visibility: context.tables.visibility.clone(),
         };
-        let fresh = mesher.mesh(&borrow(&region), sy);
+        // The workers sort solid quads by side, as uploads expect.
+        let mut fresh = mesher.mesh(&borrow(&region), sy);
+        fresh.sort_solid();
         let bytes = |m: &SectionMesh| {
             [
                 bytemuck::cast_slice::<_, u8>(&m.solid).to_vec(),

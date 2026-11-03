@@ -41,10 +41,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import anvil_dump  # noqa: E402
 import save_roundtrip_scene as scene  # noqa: E402
 
+try:
+    from . import lab
+except ImportError:
+    import lab
+
 ROOT = Path(__file__).resolve().parent.parent
 LOCAL = ROOT / '.local'
-RESOURCES = LOCAL / 'horizon-client' / '26.3'
-SERVER = LOCAL / 'minecraft' / '26.3' / 'jars' / 'server.jar'
+RESOURCES = lab.RESOURCES
+SERVER = lab.GAME / 'jars' / 'server.jar'
 RUN = LOCAL / 'save-roundtrip' / 'run'
 
 # Game rules Horizon's player changes before saving: rule -> (vanilla's value, Horizon's).
@@ -63,14 +68,24 @@ IGNORED = {
     # differently (no worldgen heightmaps, entities in entities/) is accepted.
     r'^chunk\.promoted\.(Status|Heightmaps\.(OCEAN_FLOOR_WG|WORLD_SURFACE_WG)|entities)$':
         'a proto chunk vanilla left at its view distance, finished by Horizon',
+    # Single player's server thread sends the chunks its player tracks (view distance 6
+    # and its outer ring), as vanilla's integrated server does, so it finishes some that
+    # vanilla's server (view distance 4) left before their terrain: those had no blocks,
+    # light or heightmaps to compare yet.
+    r'^chunk\.blank\.':
+        'a chunk vanilla left before its terrain (no blocks yet), finished by Horizon',
+    r'^chunk\.unlit\.':
+        'a chunk vanilla left before its light, finished (and lit) by Horizon',
     # Horizon keeps simulating between loading and saving (it needs a few seconds of
     # chunk generation first), so counters and positions of live things move on.
     r'^chunk\.block_entities\.\(2, -60, 5\)\.(cooking_time_spent|lit_time_remaining|Items\[\]\.count)$':
         'the lit furnace keeps smelting',
+    r'^chunk\.block_entities\.\(14, -60, 5\)\.CookingTimes$':
+        'the lit campfire keeps cooking',
     r'^chunk\.block_entities\..*\.(ticks_since_song_started|Age|BrewTime|warning_level|ticks_in_hive|last_vibration_frequency|listener\..*|RecipesUsed\..*|'
     r'server_data\.state_updating_resumes_at)$':
         'block entity timers advance',
-    r'^entity\.(Age|Motion\[\]|Rotation\[\]|Pos\[\]|OnGround|HurtTime|Health|TimeInOverworld|fall_distance|'
+    r'^entity\.(Passengers\[\]\.)*(Age|Motion\[\]|Rotation\[\]|Pos\[\]|OnGround|HurtTime|Health|TimeInOverworld|fall_distance|'
     r'wasOnGround|Fire|Air|DeathTime|Fuse|life|inGround|ticks_in_ground|Time)$': 'entity simulation advances',
     r'^level\.dat\.Data\.(Time|LastPlayed)$': 'clock and wall time of the save',
     r'^level\.dat\.Data\.(ServerBrands.*|singleplayer_uuid)$': 'a client world names its brand and its player',
@@ -96,15 +111,9 @@ BENIGN = re.compile(r'(Unpacking |OFFLINE/INSECURE|online-mode|authenticate user
 
 # ---------------------------------------------------------------- vanilla server
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
-
-
 class Vanilla:
     def __init__(self, directory, port=None, world='world', extra=None):
-        port = port or free_port()
+        port = port or lab.free_port()
         directory.mkdir(parents=True, exist_ok=True)
         (directory / 'eula.txt').write_text('eula=true\n')
         props = {
@@ -184,11 +193,16 @@ def entity_uuid(i):
 def entity_command(i, kind, extra):
     x = 3 + 3 * (i % 10)
     z = 36 + 3 * (i // 10)
+    # `summon` places the entity at the command's coordinates, not at NBT Pos, so a
+    # scene entry that has to stand somewhere (next to a fence) names it in Pos.
+    at = re.search(r'Pos:\[(-?[0-9.]+)d,(-?[0-9.]+)d,(-?[0-9.]+)d\]', extra)
+    if at:
+        x, z = at.group(1), at.group(3)
     nbt = (f'UUID:{entity_uuid(i)},NoAI:1b,Silent:1b,NoGravity:1b,Invulnerable:1b,Tags:["rt"],'
            f'CustomName:{{text:"E{i}"}}' + (',' + extra if extra else ''))
     if kind in ('item_frame', 'glow_item_frame', 'painting'):
         nbt += f',block_pos:[I;{x},-60,{z}],Pos:[{x}.5d,-60.0d,{z}.5d]'
-    return f'summon minecraft:{kind} {x} -60 {z} {{{nbt}}}'
+    return f'summon minecraft:{kind} {x} {at.group(2) if at else -60} {z} {{{nbt}}}'
 
 
 def block_position(i):
@@ -266,6 +280,10 @@ def build_world(directory):
         out = server.run(command)
         if command_failed(out):
             failed.append((command, out))
+    for command in scene.SETBLOCKS:
+        out = server.run(command)
+        if command_failed(out):
+            failed.append((command, out))
     for i, (kind, extra) in enumerate(scene.ENTITIES):
         command = entity_command(i, kind, extra)
         out = server.run(command)
@@ -323,7 +341,7 @@ def entity_uuid_text(i):
 
 def vscreen_env():
     text = subprocess.run(['vscreen', 'env'], capture_output=True, text=True, check=True).stdout
-    env = dict(os.environ)
+    env = lab.game_env()
     env.pop('DISPLAY', None)
     for match in re.finditer(r'(\w+)=(\S+)', text.split('unset')[0]):
         env[match.group(1)] = match.group(2)
@@ -338,8 +356,9 @@ def horizon_resave(source, destination, bin_dir):
     socket = Path(tempfile.mkdtemp(prefix='hzrt')) / 'control.sock'  # sockets need short paths
     ctl = [str(bin_dir / 'horizon-ctl'), '--socket', str(socket)]
     extra = []
-    if sys.platform == 'darwin':
-        env = dict(os.environ, HORIZON_NO_AUDIO='1')
+    # Offscreen on macOS, and on a Linux without vscreen (never a window on a real monitor).
+    if sys.platform == 'darwin' or not shutil.which('vscreen'):
+        env = lab.game_env()
         extra = ['--offscreen']
     else:
         alsa = destination / 'null-asound.conf'
@@ -459,6 +478,13 @@ def normalize_chunk(root):
     return out, sections
 
 
+# ChunkStatus before NOISE: nothing has filled the chunk's blocks yet.
+BLANK_STATUSES = {'minecraft:empty', 'minecraft:structure_starts', 'minecraft:structure_references',
+                  'minecraft:biomes'}
+# ChunkStatus LIGHT and later: the chunk's light is saved.
+LIT_STATUSES = {'minecraft:light', 'minecraft:spawn', 'minecraft:full'}
+
+
 def compare_chunks(vanilla, horizon, report):
     for key in sorted(set(vanilla) | set(horizon)):
         if key not in horizon:
@@ -471,9 +497,10 @@ def compare_chunks(vanilla, horizon, report):
         ha, hs = normalize_chunk(horizon[key])
         out = []
         diff(va, ha, 'chunk', out)
-        if va.get('Status') != 'minecraft:full' and ha.get('Status') == 'minecraft:full':
-            promoted = re.compile(r'^chunk\.(Status|Heightmaps\.\w+_WG|entities)$')
-            out = [(path.replace('chunk.', 'chunk.promoted.', 1) if promoted.match(path) else path, p, q)
+        promoted = va.get('Status') != 'minecraft:full' and ha.get('Status') == 'minecraft:full'
+        if promoted:
+            rule = re.compile(r'^chunk\.(Status|Heightmaps\.\w+_WG|entities)$')
+            out = [(path.replace('chunk.', 'chunk.promoted.', 1) if rule.match(path) else path, p, q)
                    for path, p, q in out]
         for y in sorted(set(vs) | set(hs)):
             empty = {'blocks': ['minecraft:air'] * 4096, 'biomes': None, 'BlockLight': None, 'SkyLight': None}
@@ -488,6 +515,16 @@ def compare_chunks(vanilla, horizon, report):
                 if a[light] != b[light]:
                     out.append((f'chunk.sections.{light}[{y}]', None if a[light] is None else 'present',
                                 None if b[light] is None else 'present'))
+        # Before its terrain a chunk has no blocks, light or heightmaps yet.
+        if promoted and va.get('Status') in BLANK_STATUSES:
+            blank = re.compile(r'^chunk\.(Heightmaps|sections)\.')
+            out = [(path.replace('chunk.', 'chunk.blank.', 1) if blank.match(path) else path, p, q)
+                   for path, p, q in out]
+        # Before its light step a chunk saves no light; Horizon lights what it finishes.
+        elif promoted and va.get('Status') not in LIT_STATUSES:
+            unlit = re.compile(r'^chunk\.sections\.(SkyLight|BlockLight)\[')
+            out = [(path.replace('chunk.', 'chunk.unlit.', 1) if unlit.match(path) else path, p, q)
+                   for path, p, q in out]
         for path, p, q in out:
             report.append((f'{path} @{key}', p, q))
 
@@ -508,6 +545,10 @@ def compare_entities(vanilla, horizon, report, chunks=None):
                 out[uuid] = e
         return out
     a, b = collect(vanilla), collect(horizon)
+    # Vanilla drops a lead whose holder it cannot find, which would leave nothing to compare.
+    leads = sum('leash' in e for e in a.values())
+    if leads != scene.LEADS:
+        report.append(('vanilla kept leads in the scene', scene.LEADS, leads))
     # Entities Horizon adds in the chunks vanilla never generated (chunk-generation
     # spawns) are not part of the scene; anywhere else they are a difference.
     vanilla_chunks = {chunk_of(e) for e in a.values()} | set(chunks or ())
@@ -624,7 +665,7 @@ def main():
     else:
         bin_dir = Path(args.bin_dir).resolve() if args.bin_dir else None
         if bin_dir is None:
-            subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '--bins'], cwd=ROOT, check=True)
+            subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '-p', 'horizon-client-lib', '--bins'], cwd=ROOT, check=True)
             bin_dir = ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / 'fast'
         h = horizon_resave(v0, RUN / 'h', bin_dir)
     print('comparing', v0, 'with', h)

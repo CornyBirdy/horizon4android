@@ -6,6 +6,9 @@ use gpui::{
 };
 use std::{cell::Cell, rc::Rc};
 
+/// Space reserved beside scroll content for the track and its padding.
+pub const GUTTER: f32 = 16.;
+
 #[derive(Clone, Default)]
 pub(crate) struct Scrollbar {
     pub handle: ScrollHandle,
@@ -49,8 +52,12 @@ impl Scrollbar {
     /// Wrap the scroll container, reserving a narrow gutter so the bar never covers controls.
     pub fn wrap(&self, content: Stateful<Div>, theme: &Theme) -> Div {
         let state = self.clone();
-        let track_color = theme.rule;
-        let thumb_color = theme.muted;
+        // Dark wears the glass look's thin bar: white at 14 % on no track (`scrollbar-color`).
+        let (track_color, thumb_color) = if theme.dark {
+            (gpui::transparent_black(), gpui::white().opacity(0.14))
+        } else {
+            (theme.well, theme.muted)
+        };
         div()
             .relative()
             .flex()
@@ -60,9 +67,11 @@ impl Scrollbar {
             .child(
                 content
                     .track_scroll(&self.handle)
-                    .mr(px(16.))
+                    // The glass look's bar lies over the page's own margin, as an overlay
+                    // scrollbar does; the old look keeps a gutter for its track.
+                    .mr(px(if theme.dark { 0. } else { GUTTER }))
                     // Nested scroll areas must not also move the page behind them.
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
+                    .on_scroll(|_, _, cx| cx.stop_propagation()),
             )
             .child(
                 canvas(
@@ -70,7 +79,7 @@ impl Scrollbar {
                         let geometry = Geometry::new(
                             bounds.size.height.into(),
                             state.handle.bounds().size.height.into(),
-                            state.handle.max_offset().height.into(),
+                            state.handle.max_offset().y.into(),
                             state.handle.offset().y.into(),
                         );
                         let hitbox =
@@ -83,17 +92,14 @@ impl Scrollbar {
                             return;
                         };
                         let hitbox = hitbox.unwrap();
-                        window.paint_quad(fill(bounds, track_color).corner_radii(px(3.)));
-                        window.paint_quad(
-                            fill(
-                                Bounds::new(
-                                    point(bounds.left() + px(3.), bounds.top() + px(g.top)),
-                                    size(bounds.size.width - px(6.), px(g.thumb)),
-                                ),
-                                thumb_color,
-                            )
-                            .corner_radii(px(3.)),
-                        );
+                        window.paint_quad(fill(bounds, track_color));
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.left() + px(3.), bounds.top() + px(g.top)),
+                                size(bounds.size.width - px(6.), px(g.thumb)),
+                            ),
+                            thumb_color,
+                        ));
                         window.on_mouse_event({
                             let state = state.clone();
                             move |ev: &MouseDownEvent, phase, window, cx| {

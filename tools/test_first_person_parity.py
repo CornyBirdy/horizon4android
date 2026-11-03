@@ -18,14 +18,6 @@ except ImportError:
     import lab, oracle_harness as harness
 
 
-def fbits(v):
-    return struct.pack('>f', v).hex()
-
-
-def dbits(v):
-    return struct.pack('>d', v).hex()
-
-
 def f32(v):
     return struct.unpack('>f', struct.pack('>f', v))[0]
 
@@ -52,15 +44,15 @@ def step(hit=('miss',), ac=0, uc=0, ad=False, ud=False, busy=False, using=False,
     """rot: the player's (xRot, yRot) from this step on (LocalPlayer.applyInput's hand sway)."""
     return dict(hit=list(hit), ac=ac, uc=uc, ad=ad, ud=ud, busy=busy, using=using,
                 uses=uses or dict(entity='pass', block='pass', item='pass'), shrink=shrink, set=set,
-                rot=None if rot is None else [fbits(rot[0]), fbits(rot[1])])
+                rot=None if rot is None else [lab.fbits(rot[0]), lab.fbits(rot[1])])
 
 
 def case(steps, creative=False, main=None, off=None, blocks=None, haste=None, fatigue=None):
     return dict(creative=creative, main=main, off=off, haste=haste, fatigue=fatigue,
                 blocks=[[*p, b] for p, b in (blocks or {}).items()], steps=steps,
-                rust=dict(blocks={k: [fbits(v[0]), v[1]] for k, v in BLOCKS.items()},
-                          tools={k: [fbits(v[0]), v[1]] for k, v in TOOLS.items()},
-                          attack_speed={k: dbits(v) for k, v in SPEEDS.items()}))
+                rust=dict(blocks={k: [lab.fbits(v[0]), v[1]] for k, v in BLOCKS.items()},
+                          tools={k: [lab.fbits(v[0]), v[1]] for k, v in TOOLS.items()},
+                          attack_speed={k: lab.dbits(v) for k, v in SPEEDS.items()}))
 
 
 def block_hit(pos, face=1):
@@ -69,6 +61,12 @@ def block_hit(pos, face=1):
 
 def scenarios():
     stone = {TARGETS[0]: 'minecraft:stone', TARGETS[1]: 'minecraft:dirt', TARGETS[2]: 'minecraft:glass'}
+    # Consecutive instant survival breaks have no destroy delay. Cover both
+    # zero hardness and a shovel with haste reaching one-tick destroy progress.
+    for block, main, haste in [('minecraft:short_grass', None, None),
+                                ('minecraft:dirt', ['minecraft:diamond_shovel', 1], 9)]:
+        steps = [step(block_hit(p), ac=int(i == 0), ad=True) for i, p in enumerate(TARGETS)]
+        yield case(steps + [step()] * 6, main=main, blocks={p: block for p in TARGETS}, haste=haste)
     for creative in (False, True):
         for main in ITEMS:
             # Hold attack on blocks until they break, then on the air behind.
@@ -115,6 +113,18 @@ def scenarios():
                 steps = [step()] * 25 + [step(set=dict(hand='main', stack=b), busy=busy)] + [step(busy=busy)] * 25
                 steps += [step(set=dict(hand='off', stack=a))] + [step()] * 12 + [step(ac=1)] + [step()] * 30
                 yield case(steps, False, a)
+    # #4124: mining a block above while jumping into reach: holding the
+    # attack button, the aim is lost on the way down and found again on the
+    # next jump, several times, and the block never finishes breaking.
+    for block, main in [('minecraft:stone', ['minecraft:diamond_pickaxe', 1]),
+                        ('minecraft:dirt', None),
+                        ('minecraft:stone', None)]:
+        steps = []
+        for _ in range(3):
+            steps += [step(block_hit(TARGETS[0]), ad=True)] * 6
+            steps += [step(ad=True)] * 3
+        steps += [step(block_hit(TARGETS[0]), ad=True)] * 40 + [step()] * 8
+        yield case(steps, False, main, blocks={TARGETS[0]: block})
     # Haste and mining fatigue change the swing's length.
     for haste in (None, 0, 1, 2, 4):
         for fatigue in (None, 0, 1, 2):
@@ -183,7 +193,7 @@ def main():
     harness.differential(
         'rust-first-person-parity', 'VanillaFirstPersonOracle', 'first_person_probe', make_cases, scope,
         sources=[lab.ROOT / 'crates/horizon-client/src/first_person.rs', lab.ROOT / 'crates/horizon-client/src/attack_strength.rs',
-                 lab.ROOT / 'crates/horizon-client/src/camera.rs',
+                 lab.ROOT / 'crates/horizon-client-render/src/camera.rs',
                  lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity/ParityData.java'])
 
 

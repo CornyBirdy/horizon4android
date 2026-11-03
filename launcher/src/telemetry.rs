@@ -1,6 +1,8 @@
 //! Opt-in data collection from the launcher (`horizon_telemetry`): the player's answer, what
 //! would be sent, deleting it, bug reports and benchmark uploads, and sending the outbox when
 //! the launcher starts and closes. The window, the CLI and the MCP server all go through here.
+//! Also the live count's side here: what the "I'm playing" ping holds, in words, and reading
+//! how many play now (`horizon_telemetry::live`).
 use std::path::{Path, PathBuf};
 
 use horizon_telemetry::payload::{Bug, Crash, Perf, System, Timings};
@@ -15,7 +17,7 @@ pub const SWITCHES: [(Kind, &str, &str); 4] = [
     (
         Kind::Perf,
         "Performance statistics",
-        "After each session: frame-time percentiles and a 14-bucket histogram, tick times, peak memory and startup times, with your OS, CPU, GPU, driver, memory size and the settings that change performance.",
+        "After each session: frame-time percentiles and a 14-bucket histogram, tick times, peak memory and startup times, with your machine (OS, CPU and its cores and clocks, memory size, GPU, its memory and driver, drive type, screen size and refresh rate, laptop or desktop, on battery or not) and the settings that change performance.",
     ),
     (
         Kind::Crash,
@@ -36,6 +38,92 @@ pub const SWITCHES: [(Kind, &str, &str); 4] = [
 
 /// Never sent, whatever the switches say.
 pub const NEVER: &str = "Never sent: your account name or UUID, world names, server addresses, chat, or your IP address. Each report is dated to the day, under a random install ID you can delete.";
+
+/// The anonymous "I'm playing" ping the game sends whatever the switches say (Ludovic's
+/// decision, 2026-10-22: count everyone, and tell them). Shown on the first-run question, in
+/// Settings, and once on the Play page to players who answered before it existed.
+pub const PING_NAME: &str = "\"I'm playing\" ping";
+pub const PING: &str = "While you play, the game sends an anonymous \"I'm playing\" ping once a minute, so the launcher can show how many people play Horizon right now. It holds: a random number made when the game starts and forgotten when it closes, the Horizon version, your OS (Linux, macOS or Windows), and whether you have a world open to LAN or friends. It doesn't hold: your account, your install ID, world or server names, or anything you do in the game, and the server doesn't keep your IP address. It is sent whatever the switches say.";
+
+/// How many play Horizon now (exact), if the server says.
+pub fn playing_now() -> Option<u64> {
+    let endpoint = horizon_telemetry::endpoint()?;
+    horizon_telemetry::live::fetch(&endpoint)
+        .ok()
+        .map(|count| count.playing)
+}
+
+/// The page with the count over time and its peaks, on the website `links.json` names; None when
+/// it names none.
+pub fn stats_url(website: &str) -> Option<String> {
+    let site = website.trim().trim_end_matches('/');
+    site.starts_with("https://")
+        .then(|| format!("{site}/stats"))
+}
+
+/// Sends [`playing_now`] to the window as `Msg::Playing` now and every minute, on its own
+/// thread. Nothing at all when sending is turned off.
+pub fn watch_playing(tx: std::sync::mpsc::Sender<backend::Msg>) {
+    if horizon_telemetry::endpoint().is_none() {
+        return;
+    }
+    std::thread::spawn(move || {
+        while tx.send(backend::Msg::Playing(playing_now())).is_ok() {
+            std::thread::sleep(horizon_telemetry::live::INTERVAL);
+        }
+    });
+}
+
+/// The official server's address from links.json once read (`set_official_server`; empty: none),
+/// the built-in one until then.
+static OFFICIAL_SERVER: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// The official server [`watch_official`] asks from now on: `Links::official_server`.
+pub fn set_official_server(address: &str) {
+    *OFFICIAL_SERVER.write().unwrap_or_else(|e| e.into_inner()) = Some(address.trim().to_owned());
+}
+
+fn official_server() -> String {
+    OFFICIAL_SERVER
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| crate::server_list::OFFICIAL_ADDRESS.to_owned())
+}
+
+/// How many play on the official server now: its server-list status ping, as the game's
+/// Multiplayer list sends it (through the address's SRV record), with a 3-second timeout. None
+/// when it doesn't answer or there is no official server.
+pub fn official_players(address: &str) -> Option<u64> {
+    let (host, port) = horizon_telemetry::server_status::split_address(address)?;
+    let (host, port) = horizon_protocol::server_redirect(&host, port);
+    horizon_telemetry::server_status::players_at(
+        address,
+        (&host, port),
+        std::time::Duration::from_secs(3),
+    )
+    .ok()
+    .map(|players| players.online)
+}
+
+/// Sends [`official_players`] to the window as `Msg::OfficialPlayers` now and every minute, on
+/// its own thread. Nothing when `HORIZON_TELEMETRY_URL=off` (tests and automated runs) turns the
+/// live count off too.
+pub fn watch_official(tx: std::sync::mpsc::Sender<backend::Msg>) {
+    if horizon_telemetry::endpoint().is_none() {
+        return;
+    }
+    std::thread::spawn(move || {
+        while tx
+            .send(backend::Msg::OfficialPlayers(official_players(
+                &official_server(),
+            )))
+            .is_ok()
+        {
+            std::thread::sleep(horizon_telemetry::live::INTERVAL);
+        }
+    });
+}
 
 pub fn home() -> PathBuf {
     backend::game_home()
@@ -67,7 +155,7 @@ pub fn preview() -> (String, String) {
         );
         return (what, upload::preview(&home));
     }
-    let system = System::detect();
+    let system = with_example_gpu(System::detect_in(Some(&home)));
     let examples = vec![
         Item::new(
             Source::Game,
@@ -108,9 +196,27 @@ pub fn preview() -> (String, String) {
     }))
     .unwrap_or_default();
     (
-        "Nothing is waiting. One example of each kind, from this machine (a benchmark upload is the report itself, see docs/benchmark-report.md):".into(),
+        "Nothing is waiting. One example of each kind, from this machine; the game fills in the GPU and screen it uses where these say example (a benchmark upload is the report itself, see docs/benchmark-report.md):".into(),
         json,
     )
+}
+
+/// What only the game knows (the GPU it draws with, the screen its window is on), as an
+/// example: the launcher draws with neither.
+pub fn with_example_gpu(mut system: System) -> System {
+    system.gpu = "example: the GPU the game draws with".into();
+    system.gpu_vendor = "nvidia".into();
+    system.gpu_kind = "discrete".into();
+    system.vram_mb = 8192;
+    system.driver = "example: 570.86".into();
+    system.backend = "Vulkan".into();
+    system.display = Some(horizon_telemetry::payload::Display {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+        scale: 1.0,
+    });
+    system
 }
 
 /// "Delete my data": the server deletes everything sent under this install's ID, the waiting
@@ -122,7 +228,9 @@ pub fn delete_my_data() -> Result<String, String> {
     outbox::clear(&home).map_err(|e| e.to_string())?;
     let remote = match horizon_telemetry::endpoint() {
         _ if consent.install_id.is_empty() => "Nothing was ever sent from here.",
-        None => "Nothing was sent: there is no data server yet.",
+        None => {
+            "Sending is turned off here (HORIZON_TELEMETRY_URL=off), so the server was not asked."
+        }
         Some(url) => {
             upload::delete_remote(&url, &consent.install_id)
                 .map_err(|e| format!("The server could not be reached ({e}). Try again later."))?;
@@ -172,7 +280,7 @@ pub fn bug_report(text: &str, with_log: bool) -> Result<Item, String> {
         Source::Launcher,
         backend::VERSION,
         Payload::Bug(Bug {
-            system: System::detect(),
+            system: System::detect_in(Some(&home())),
             text: scrubber().scrub(text.trim()),
             log: with_log.then(log_for_report).flatten(),
         }),
@@ -201,7 +309,7 @@ pub fn submit(item: &Item) -> Result<String, String> {
     Ok(match send() {
         Flush::Sent { .. } => "Sent. Thank you.".into(),
         Flush::Nothing if horizon_telemetry::endpoint().is_none() => {
-            "Kept to be sent once the data server is up.".into()
+            "Kept; sending is turned off here (HORIZON_TELEMETRY_URL=off).".into()
         }
         _ => "Kept; it will be sent the next time the launcher starts.".into(),
     })
@@ -249,6 +357,7 @@ pub fn status_json() -> serde_json::Value {
         "install_id": consent.install_id,
         "waiting": outbox::pending(&home()).len(),
         "server": horizon_telemetry::endpoint(),
+        "ping": PING,
     })
 }
 
@@ -299,6 +408,35 @@ pub fn set(kinds: &[Kind], on: bool) -> Result<Consent, String> {
 mod tests {
     use super::*;
 
+    /// The official server's count through its SRV record, from the live server (network):
+    /// `cargo test --lib official_count -- --ignored`. Its port 25565 is another server.
+    #[test]
+    #[ignore = "asks the live official server"]
+    fn official_count_follows_the_srv_record() {
+        let (host, port) =
+            horizon_protocol::server_redirect(crate::server_list::OFFICIAL_ADDRESS, 25565);
+        assert_eq!(
+            (host.trim_end_matches('.'), port),
+            ("play.playhorizon.dev", 24454)
+        );
+        assert!(official_players(crate::server_list::OFFICIAL_ADDRESS).is_some());
+        assert_eq!(official_players(""), None);
+    }
+
+    #[test]
+    fn the_stats_page_is_on_the_website() {
+        assert_eq!(
+            stats_url("https://playhorizon.dev").as_deref(),
+            Some("https://playhorizon.dev/stats")
+        );
+        assert_eq!(
+            stats_url("https://example.org/horizon/").as_deref(),
+            Some("https://example.org/horizon/stats")
+        );
+        assert_eq!(stats_url(""), None);
+        assert_eq!(stats_url("javascript:alert(1)"), None);
+    }
+
     #[test]
     fn kinds_are_named_in_plain_words_or_short() {
         let names = |n: &[&str]| parse_kinds(&n.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -308,6 +446,20 @@ mod tests {
         );
         assert_eq!(names(&["all"]).unwrap(), Kind::ALL);
         assert!(names(&["everything"]).is_err());
+    }
+
+    /// "View what would be sent" and `data show` list every hardware field.
+    #[test]
+    fn the_example_shows_every_hardware_field() {
+        let json = serde_json::to_string(&with_example_gpu(System::detect())).unwrap();
+        let fields = "os os_version arch cpu threads cores cpu_base_mhz cpu_boost_mhz ram_gb gpu \
+            gpu_vendor gpu_kind vram_mb driver backend storage width height refresh_hz scale power form";
+        for field in fields.split_whitespace() {
+            assert!(
+                json.contains(&format!("\"{field}\":")),
+                "{field} missing from {json}"
+            );
+        }
     }
 
     #[test]

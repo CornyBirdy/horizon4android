@@ -38,12 +38,12 @@ jobs:
           shared-key: android-desktop
       - name: Formatting
         run: cargo fmt --all -- --check
-      - name: Clippy (client, mods)
+      - name: Clippy (client)
         run: |
-          cargo clippy -p horizon-client -p horizon-mods --all-targets -- -D warnings
+          cargo clippy -p horizon-client --all-targets -- -D warnings
           cargo clippy -p horizon-client --all-targets --no-default-features -- -D warnings
-      - name: Tests (client, mods)
-        run: cargo test -p horizon-client -p horizon-mods
+      - name: Tests (client)
+        run: cargo test -p horizon-client
 
   apk:
     runs-on: ubuntu-latest

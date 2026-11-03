@@ -1,4 +1,5 @@
-//! Play with friends, host side: "Invite friends" opens the world to LAN if
+//! Play with friends, host side: "Start Sharing" on the Play with Friends
+//! screen (`friends_screen`, the pause menu's Friends button) opens the world to LAN if
 //! it isn't (with Open to LAN's defaults) and shares that port behind an
 //! invite code (horizon-friends). The code holds this computer's addresses
 //! and the key, so friends join with no server of ours; a relay the player
@@ -6,7 +7,13 @@
 //! LAN one, unchanged: tunnelled guests are LAN guests that connect from the
 //! loopback address.
 use super::{Game, lan::LanSettings};
-use horizon_client::{Result, front::FriendsView, text::Text};
+use horizon_client::{
+    Result,
+    friends_screen::{self, Action, FriendsView},
+    hud::HudBatch,
+    lang,
+    text::Text,
+};
 use horizon_friends::{Host, HostConfig, HostEvent, PathMode, host::DEFAULT_PORT, reach, stun};
 use horizon_protocol::{GAME_VERSION, PROTOCOL_VERSION};
 use std::time::{Duration, Instant};
@@ -52,10 +59,12 @@ impl Game<'_> {
         if self.friends.is_some() {
             return Ok(());
         }
-        if self.remote.is_some() || self.title.is_some() {
+        // Single player on its server thread shares that server, as Open to
+        // LAN publishes it; another server can't be shared.
+        if self.title.is_some() || (self.remote.is_some() && self.integrated.is_none()) {
             return Err("open a singleplayer world first".into());
         }
-        let opened_lan = self.lan.is_none();
+        let opened_lan = self.lan_port().is_none();
         if opened_lan {
             // ShareToLanScreen's defaults, as the world options screen offers them.
             self.lan_open(LanSettings {
@@ -113,7 +122,10 @@ impl Game<'_> {
         if sharing.opened_lan {
             self.lan_close(true);
         } else {
-            self.system_message(Text::literal("Stopped sharing the invite code."));
+            self.system_message(Text::literal(lang::get_or(
+                "horizon.friends.stopped",
+                "Stopped sharing the invite code.",
+            )));
         }
     }
 
@@ -134,9 +146,10 @@ impl Game<'_> {
             match event {
                 HostEvent::Code(code) => {
                     if sharing.code.is_some() && sharing.wrong >= horizon_friends::host::MAX_WRONG {
-                        sharing.notice = Some(
-                            "Someone kept trying a wrong short code, so it changed.".to_owned(),
-                        );
+                        sharing.notice = Some(lang::get_or(
+                            "horizon.friends.short_code_changed",
+                            "Someone kept trying a wrong short code, so it changed.",
+                        ));
                         sharing.wrong = 0;
                     }
                     announce = sharing.code.is_none();
@@ -144,7 +157,10 @@ impl Game<'_> {
                 }
                 HostEvent::WrongCode { count } => {
                     sharing.wrong = count;
-                    sharing.notice = Some("Someone tried a wrong code.".to_owned());
+                    sharing.notice = Some(lang::get_or(
+                        "horizon.friends.wrong_code",
+                        "Someone tried a wrong code.",
+                    ));
                 }
                 HostEvent::Connected { direct: true, .. } => sharing.paths.0 += 1,
                 HostEvent::Connected { direct: false, .. } => sharing.paths.1 += 1,
@@ -152,9 +168,10 @@ impl Game<'_> {
             }
         }
         if announce {
-            self.system_message(Text::literal(
-                "Your invite code is ready in the pause menu: copy it and send it to your friends.",
-            ));
+            self.system_message(Text::literal(lang::get_or(
+                "horizon.friends.code_ready",
+                "Your invite code is ready: Game Menu, Play with Friends. Copy it and send it to your friends.",
+            )));
         }
     }
 
@@ -169,22 +186,73 @@ impl Game<'_> {
         }
     }
 
-    /// What the pause menu shows.
+    /// Play with Friends. The world is paused under it in singleplayer, so
+    /// new codes and sessions are read while it is drawn.
+    pub(super) fn draw_friends_screen(&mut self, batch: &mut HudBatch) {
+        self.tick_friends();
+        let view = self.friends_view();
+        horizon_client::widgets::begin_screen(|| {
+            horizon_client::widgets::ScreenInfo::new("friends", friends_screen::TITLE)
+        });
+        friends_screen::draw(batch, &self.gui.atlas, self.cursor, &view, true);
+    }
+    pub(super) fn friends_screen_click(&mut self) {
+        let view = self.friends_view();
+        let Some(action) =
+            friends_screen::click(&self.gui.atlas, self.gui_size(), self.cursor, &view)
+        else {
+            return;
+        };
+        self.audio.play_button_click();
+        match action {
+            Action::Share => {
+                if let Err(e) = self.friends_start() {
+                    self.system_message(Text::literal(
+                        lang::get_or(
+                            "horizon.friends.share_failed",
+                            "Couldn't share the world: %s",
+                        )
+                        .replacen("%s", &e.to_string(), 1),
+                    ));
+                }
+            }
+            Action::Copy => self.friends_copy(),
+            Action::Stop => self.friends_stop(),
+            // The system browser, as the folder buttons open their folders.
+            Action::Help => {
+                if let Some(url) = &view.help {
+                    super::packs::open_folder(std::path::Path::new(url));
+                }
+            }
+            Action::Done => self.screen = super::Screen::Paused,
+        }
+    }
+
+    /// What Play with Friends shows.
     pub(super) fn friends_view(&self) -> FriendsView {
-        let guests = self
-            .lan
-            .as_ref()
-            .map(|h| h.hub.guests.iter().map(|g| g.name.clone()).collect())
-            .unwrap_or_default();
+        let guests = match &self.lan {
+            Some(h) => h.hub.guests.iter().map(|g| g.name.clone()).collect(),
+            // On the server thread: the other players the server lists.
+            None if self.integrated.is_some() => {
+                let me = self.options.player_name();
+                let mut names = self.remote_online_names().unwrap_or_default();
+                names.retain(|n| *n != me);
+                names
+            }
+            None => Vec::new(),
+        };
         let Some(s) = &self.friends else {
             return FriendsView {
-                shown: self.remote.is_none(),
+                shown: self.remote.is_none() || self.integrated.is_some(),
                 ..FriendsView::default()
             };
         };
         let state = s.host.state();
         let mut status = if s.code.is_none() {
-            "Finding how friends can reach you…".to_owned()
+            lang::get_or(
+                "horizon.friends.finding_route",
+                "Finding how friends can reach you…",
+            )
         } else {
             state.summary.clone()
         };

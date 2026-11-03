@@ -54,7 +54,7 @@ pub fn prepared_resources(dir: &Path) -> Option<PathBuf> {
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v["minecraft"]["version"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| "26.3".into());
+        .unwrap_or_else(|| horizon_core::VANILLA_VERSION.into());
     let resources = dir.join(".local/horizon-client").join(version);
     resources
         .join("horizon-resources.json")
@@ -204,6 +204,9 @@ pub fn launch(socket: &Path, args: &[String]) -> Result<Value, Value> {
     let stderr = file
         .try_clone()
         .map_err(|e| json!({ "error": e.to_string(), "kind": "launch" }))?;
+    // Windows: the game would otherwise hold our caller's pipes open (horizon-threads).
+    #[cfg(windows)]
+    horizon_threads::keep_stdio_from_children();
     let mut child = cmd
         .args(&o.game_args)
         .arg("--control-socket")

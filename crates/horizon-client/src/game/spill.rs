@@ -5,9 +5,12 @@
 //! world as soon as the behaviour returns, within the same tick.
 use super::{Game, GameLevel, Screen, dispenser::new_item_motion, storage::is_shulker_box};
 use horizon_client::{
+    block_entity_item, block_entity_nbt,
     containers::{Banner, BlockEntity},
+    furnace::FurnaceCooking,
     item_data,
     items::ItemStack,
+    save,
 };
 use horizon_core::position::BlockPos;
 use horizon_core::random::RandomSource;
@@ -16,7 +19,7 @@ use horizon_world::{
         LevelEvent,
         removal::{self, PreRemove},
     },
-    nbt::{JavaString, Tag},
+    nbt::{Compound, JavaString, Tag},
     registry::BlockStateId,
 };
 use std::collections::HashMap;
@@ -32,6 +35,9 @@ pub(super) struct Pending {
     pub(super) names: HashMap<[i32; 3], (String, String)>,
     /// A decorated pot's sherds (back, left, right, front).
     pub(super) pot: HashMap<[i32; 3], [Option<ItemStack>; 4]>,
+    /// A head's profile, note block sound and name, or a hive's bees: the
+    /// dropped item and the component patch it takes.
+    pub(super) copied: HashMap<[i32; 3], (String, Compound)>,
 }
 impl Pending {
     /// Remember what the block entity at `pos` copies into the drops of `block`.
@@ -48,6 +54,31 @@ impl Pending {
         }
         if let Some(name) = name {
             self.names.insert(pos, (block.to_owned(), name));
+        }
+        // `copy_components` from the block entity: the head tables copy the
+        // profile (player heads), note block sound and name, the hive tables
+        // the bees.
+        let include: &[&str] = match entity {
+            BlockEntity::Skull(_) if block.starts_with("minecraft:player_") => &[
+                "minecraft:profile",
+                "minecraft:note_block_sound",
+                "minecraft:custom_name",
+            ],
+            BlockEntity::Skull(_) => &["minecraft:custom_name"],
+            BlockEntity::Beehive(_) => &["minecraft:bees"],
+            _ => &[],
+        };
+        if !include.is_empty() {
+            let saved = save::encode_block_entity((pos[0], pos[1], pos[2]), entity, block);
+            let mut patch = block_entity_nbt::canonical(&saved)
+                .map(|saved| block_entity_item::pick(&saved))
+                .unwrap_or_default();
+            patch.retain(|k, _| include.contains(&k.to_string_lossy().as_str()));
+            if !patch.is_empty() {
+                // `Blocks.wallVariant`: a wall head drops the standing item.
+                let item = block.replacen("_wall_", "_", 1);
+                self.copied.insert(pos, (item, patch));
+            }
         }
         if is_shulker_box(block)
             && let BlockEntity::Chest(items) = entity
@@ -74,7 +105,21 @@ impl Pending {
             .is_some_and(|(item, _)| **item == *stack.item)
             && let Some((_, name)) = self.names.remove(&pos)
         {
-            stack.data_mut().custom_name = Some(name);
+            stack.data_mut().custom_name =
+                Some(horizon_world::nbt::Tag::String(name.as_str().into()));
+        }
+        if self
+            .copied
+            .get(&pos)
+            .is_some_and(|(item, _)| **item == *stack.item)
+            && let Some((_, copied)) = self.copied.remove(&pos)
+        {
+            let mut patch = match item_data::encode_components(stack) {
+                Some(Tag::Compound(c)) => c,
+                _ => Default::default(),
+            };
+            patch.extend(copied);
+            (stack.damage, stack.extra) = item_data::decode_components(Some(&Tag::Compound(patch)));
         }
         if &*stack.item == "minecraft:decorated_pot" {
             // The pot's block entity always copies its decorations, empty or not.
@@ -155,6 +200,7 @@ impl Pending {
         self.shulker.remove(&pos);
         self.banner.remove(&pos);
         self.names.remove(&pos);
+        self.copied.remove(&pos);
     }
 }
 
@@ -171,11 +217,60 @@ pub(super) struct Spawn {
 pub(super) struct Spill {
     pub(super) spawns: Vec<Spawn>,
     /// Experience orbs (`ExperienceOrb.award`): where and how much, each
-    /// having drawn its merge id from the level random.
-    pub(super) orbs: Vec<([f64; 3], u32)>,
+    /// and the merge id it drew from the level random.
+    pub(super) orbs: Vec<([f64; 3], u32, i32)>,
     /// Block entities the behaviour removed, for the game's own follow-ups
     /// (open screens, playing songs).
     pub(super) removed: Vec<([i32; 3], BlockEntity)>,
+    /// Runs of `spawns` a player's use popped (a picked berry bush), for the
+    /// mods' `native_loot_drops`.
+    pub(super) used: Vec<UsedDrops>,
+}
+
+/// `spawns[start..end]` came from `table` at the block `pos` in `state`.
+pub(super) struct UsedDrops {
+    start: usize,
+    end: usize,
+    pos: [i32; 3],
+    state: BlockStateId,
+    table: &'static str,
+}
+
+impl Spill {
+    pub(super) fn is_empty(&self) -> bool {
+        self.spawns.is_empty()
+            && self.orbs.is_empty()
+            && self.removed.is_empty()
+            && self.used.is_empty()
+    }
+}
+
+/// Lets `say` change each use's run of `spawns`, newest first so the earlier
+/// ranges hold. A run's stacks keep their spots, and a stack `say` adds takes
+/// the run's last spot, else the block's top.
+fn retell_runs(
+    spawns: &mut Vec<Spawn>,
+    used: &[UsedDrops],
+    mut say: impl FnMut(&UsedDrops, [f64; 3], &mut Vec<ItemStack>),
+) {
+    for used in used.iter().rev() {
+        let run: Vec<Spawn> = spawns.drain(used.start..used.end).collect();
+        let mut drops: Vec<ItemStack> = run.iter().map(|s| s.stack.clone()).collect();
+        let origin = used.pos.map(|c| f64::from(c) + 0.5);
+        say(used, origin, &mut drops);
+        let top = [origin[0], origin[1] + 0.5, origin[2]];
+        let kept: Vec<Spawn> = drops
+            .into_iter()
+            .enumerate()
+            .map(|(i, stack)| Spawn {
+                stack,
+                pos: run.get(i).or(run.last()).map_or(top, |s| s.pos),
+                motion: run.get(i).and_then(|s| s.motion),
+                delay: run.get(i).map_or(10, |s| s.delay),
+            })
+            .collect();
+        spawns.splice(used.start..used.start, kept);
+    }
 }
 
 /// `Block.popResource`: a spot around the block's centre from the level random.
@@ -272,7 +367,12 @@ impl GameLevel<'_> {
     }
     /// `Block.dropFromBlockInteractLootTable` with `Block.popResource` of
     /// every stack.
-    pub(super) fn drop_interact_loot(&mut self, pos: BlockPos, state: BlockStateId, table: &str) {
+    pub(super) fn drop_interact_loot(
+        &mut self,
+        pos: BlockPos,
+        state: BlockStateId,
+        table: &'static str,
+    ) {
         let drops = self.items.interact_loot(
             table,
             self.registry,
@@ -281,11 +381,19 @@ impl GameLevel<'_> {
             self.rand_sequences,
             self.seed,
         );
+        let start = self.spill.spawns.len();
         for stack in drops {
             if &*stack.item != "minecraft:air" && stack.count > 0 {
                 self.pop_resource([pos.x, pos.y, pos.z], stack);
             }
         }
+        self.spill.used.push(UsedDrops {
+            start,
+            end: self.spill.spawns.len(),
+            pos: [pos.x, pos.y, pos.z],
+            state,
+            table,
+        });
     }
     /// `Block.dropResources(state, level, pos, blockEntity)`: the block's loot
     /// (from its random sequence, else the level random), with what its block
@@ -325,9 +433,12 @@ impl GameLevel<'_> {
         // BlockBehaviour.spawnAfterBreak with no tool: ores, sculk and spawners
         // award experience at the block's centre.
         let name = self.facts.get(state).name.clone();
-        if let Some(xp) = removal::break_experience(&mut self.world.random, &name)
+        if let Some(mut xp) = removal::break_experience(&mut self.world.random, &name)
             && self.rules.block_drops
         {
+            if self.native_authoritative {
+                self.native_block_exp(self.dimension, pos, &name, &mut xp);
+            }
             let centre = [
                 f64::from(pos.x) + 0.5,
                 f64::from(pos.y) + 0.5,
@@ -342,8 +453,8 @@ impl GameLevel<'_> {
         while amount > 0 {
             let value = removal::orb_value(amount);
             amount -= value;
-            let _merge_id = self.world.random.next_int_bound(40);
-            self.spill.orbs.push((at, value));
+            let merge_id = self.world.random.next_int_bound(40).unwrap_or(0);
+            self.spill.orbs.push((at, value, merge_id));
         }
     }
     /// `BlockEntity.preRemoveSideEffects` and `removeBlockEntity` for the block
@@ -368,21 +479,55 @@ impl GameLevel<'_> {
         }
         let entity = self.world.block_entities.remove(&key);
         self.world.block_names.remove(&key);
+        self.world.forget_block_entity_source(key);
         let name = self.facts.get(old).name.clone();
-        let kind = removal::pre_remove(&name);
+        let kind = match &entity {
+            // BaseContainerBlockEntity.preRemoveSideEffects: Containers.dropContents.
+            Some(BlockEntity::Mod(m))
+                if !m.items.is_empty()
+                    && self.world.block_entities.mod_container(old.0).is_some() =>
+            {
+                PreRemove::Contents {
+                    slots: m.items.len(),
+                    furnace: false,
+                }
+            }
+            _ => removal::pre_remove(&name),
+        };
         let mut neighbour_updates = 0;
         if side_effects {
             match kind {
-                PreRemove::Contents { slots, .. } => {
+                PreRemove::Contents { slots, furnace } => {
                     let items = entity.as_ref().map_or(&[][..], BlockEntity::slots);
                     for slot in 0..slots {
                         let stack = items.get(slot).cloned().flatten();
                         self.drop_item_stack(pos, stack);
                     }
+                    // AbstractFurnaceBlockEntity.preRemoveSideEffects: then the
+                    // experience of what it made, at the block's centre.
+                    if furnace && let Some(BlockEntity::Furnace(f)) = &entity {
+                        let at = [
+                            f64::from(pos.x) + 0.5,
+                            f64::from(pos.y) + 0.5,
+                            f64::from(pos.z) + 0.5,
+                        ];
+                        for (count, experience) in f.recipe_experience(self.recipes) {
+                            let xp = horizon_client::containers::create_experience(
+                                count,
+                                experience,
+                                &mut self.world.random,
+                            );
+                            self.award_orbs(at, xp);
+                        }
+                    }
                 }
                 PreRemove::Campfire => {
-                    for _ in 0..4 {
-                        self.drop_item_stack(pos, None);
+                    let items = match &entity {
+                        Some(BlockEntity::Campfire(c)) => c.items.clone(),
+                        _ => Default::default(),
+                    };
+                    for stack in items {
+                        self.drop_item_stack(pos, stack);
                     }
                 }
                 PreRemove::Jukebox => {
@@ -390,7 +535,7 @@ impl GameLevel<'_> {
                     // events and a neighbour update), the record pops, and
                     // onSongChanged updates the neighbours again.
                     if let Some(BlockEntity::Jukebox(j)) = &entity
-                        && let Some(record) = j.record.clone()
+                        && let Some(record) = j.record().cloned()
                     {
                         if j.playing {
                             self.jukebox_stopped(pos, old);
@@ -529,6 +674,14 @@ impl GameLevel<'_> {
         }
         true
     }
+    /// `Containers.dropContents` for a mod block entity that left the world
+    /// during its own tick (the block broke itself): what it held spills as
+    /// vanilla's `preRemoveSideEffects` would, instead of vanishing with it.
+    pub(super) fn drop_lost_contents(&mut self, pos: BlockPos, items: Vec<Option<ItemStack>>) {
+        for stack in items {
+            self.drop_item_stack(pos, stack);
+        }
+    }
     /// `Containers.dropItemStack` of one slot (an empty one still draws its spot).
     fn drop_item_stack(&mut self, pos: BlockPos, stack: Option<ItemStack>) {
         let count = stack.as_ref().map_or(0, |s| s.count);
@@ -551,19 +704,22 @@ impl Game<'_> {
     /// Add the item entities the block behaviour spawned and follow up on the
     /// block entities it removed.
     pub(super) fn flush_spill(&mut self) {
-        if self.spill.spawns.is_empty()
-            && self.spill.removed.is_empty()
-            && self.spill.orbs.is_empty()
-        {
+        if self.spill.is_empty() {
             return;
         }
-        let spill = std::mem::take(&mut self.spill);
+        let mut spill = std::mem::take(&mut self.spill);
+        let used = std::mem::take(&mut spill.used);
+        let tool = self.held().cloned();
+        retell_runs(&mut spill.spawns, &used, |used, origin, drops| {
+            let block = Some((used.pos, used.state));
+            self.native_use_drops(used.table, origin, block, None, tool.as_ref(), drops);
+        });
         for s in spill.spawns {
             let motion = s.motion.unwrap_or_else(new_item_motion);
             self.spawn_item(s.stack, s.pos, motion, s.delay);
         }
-        for (at, value) in spill.orbs {
-            self.add_orb(at, value);
+        for (at, value, merge_id) in spill.orbs {
+            self.award_orb(at, value, merge_id);
         }
         for (pos, entity) in spill.removed {
             let key = (pos[0], pos[1], pos[2]);
@@ -584,6 +740,46 @@ mod tests {
     use super::*;
     use horizon_client::{block_entity_item, item_data, mobs::raider, save};
     use horizon_world::nbt::Tag;
+
+    #[test]
+    fn a_used_run_is_retold_in_place() {
+        let spawn = |item: &str, x: f64| Spawn {
+            stack: ItemStack::new(item, 1),
+            pos: [x, 0.0, 0.0],
+            motion: None,
+            delay: 10,
+        };
+        let mut spawns = vec![
+            spawn("minecraft:stone", 0.0),
+            spawn("minecraft:sweet_berries", 1.0),
+            spawn("minecraft:sweet_berries", 2.0),
+            spawn("minecraft:dirt", 3.0),
+        ];
+        let used = [UsedDrops {
+            start: 1,
+            end: 3,
+            pos: [4, 64, 4],
+            state: BlockStateId(0),
+            table: "minecraft:harvest/sweet_berry_bush",
+        }];
+        retell_runs(&mut spawns, &used, |used, origin, drops| {
+            assert_eq!(used.table, "minecraft:harvest/sweet_berry_bush");
+            assert_eq!(origin, [4.5, 64.5, 4.5]);
+            assert_eq!(drops.len(), 2);
+            drops.remove(0);
+            drops.push(ItemStack::new("minecraft:diamond", 1));
+        });
+        let items: Vec<(&str, f64)> = spawns.iter().map(|s| (&*s.stack.item, s.pos[0])).collect();
+        assert_eq!(
+            items,
+            [
+                ("minecraft:stone", 0.0),
+                ("minecraft:sweet_berries", 1.0),
+                ("minecraft:diamond", 2.0),
+                ("minecraft:dirt", 3.0),
+            ]
+        );
+    }
 
     #[test]
     fn ominous_banner_survives_placement_save_and_drop() {

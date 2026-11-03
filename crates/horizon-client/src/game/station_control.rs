@@ -10,6 +10,7 @@ pub(super) const HELP: &[&str] = &[
     "use X Y Z                      open the block's menu as if right-clicked",
     "click-slot ID [right] [shift]  click a menu slot (0-35 inventory, 300+ container, 600+ station, 650 result)",
     "click-gui X Y [right] [shift]  click at GUI pixel X Y relative to the menu's top-left corner",
+    "book [next|back|take|sign|done] the open book or lectern: its page, or press one of its buttons",
     "type TEXT | type-back          type into the anvil name box / delete one character",
     "enchant ID LEVEL               enchant the held item (books store the enchantment)",
     "potion ITEM POTION             give a potion item (potion, splash_potion, lingering_potion, tipped_arrow)",
@@ -46,13 +47,20 @@ impl Game<'_> {
         use winit::keyboard::KeyCode;
         let saved = self.cursor;
         self.cursor = (x, y);
-        let had_shift = self.physical_keys.contains(&KeyCode::ShiftLeft);
-        if shift {
-            self.physical_keys.insert(KeyCode::ShiftLeft);
-        }
+        let held = shift.then(|| {
+            horizon_client_input::modifiers::hold(
+                &mut self.modifiers,
+                &mut self.physical_keys,
+                KeyCode::ShiftLeft,
+            )
+        });
         self.click_inventory(right);
-        if shift && !had_shift {
-            self.physical_keys.remove(&KeyCode::ShiftLeft);
+        if let Some(held) = held {
+            horizon_client_input::modifiers::restore(
+                &mut self.modifiers,
+                &mut self.physical_keys,
+                held,
+            );
         }
         self.cursor = saved;
     }
@@ -126,7 +134,7 @@ impl Game<'_> {
             "enchant" => {
                 let e = id(arg(1)?);
                 let level: u32 = arg(2)?.parse()?;
-                if self.res.stations().enchantments.get(&e).is_none() {
+                if self.stations().enchantments.get(&e).is_none() {
                     return Err(format!("unknown enchantment {e}").into());
                 }
                 let held = self.inventory[self.selected]
@@ -136,6 +144,7 @@ impl Game<'_> {
                 self.apply_equipment();
                 ok()
             }
+            "book" => Ok(Some(self.book_control(words.get(1).copied())?)),
             "potion" => {
                 let stack = ItemStack::new(&id(arg(1)?), 1).with_potion(&id(arg(2)?));
                 let rest = self.give(stack);

@@ -22,9 +22,14 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Strin
 }
 
 /// Step 1: the pack at `pack` to `<work>/pack.json`.
-pub fn import(pack: &Path, work: &Path, log: Log) -> Result<import::Pack, String> {
-    let pack = import::import(pack)?;
+pub fn import(source: &Path, work: &Path, log: Log) -> Result<import::Pack, String> {
+    let pack = import::import(source)?;
     fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
+    // A bad resource-pack entry must not stop the pack's mods from importing.
+    match crate::resourcepacks::stage(source, work, &pack).and_then(|r| r.save(work)) {
+        Ok(()) => {}
+        Err(e) => log(format!("resource packs not staged: {e}")),
+    }
     write_json(&work.join("pack.json"), &pack)?;
     let mut kinds = BTreeMap::<&str, usize>::new();
     for f in &pack.files {
@@ -102,7 +107,12 @@ pub fn carry(
     let records: Vec<inventory::Record> = read_json(&work.join("inventory.json"))?;
     let facts_path = work.join("oracle/facts.json");
     let facts = if facts_path.exists() {
-        let f = oracle::Facts::read(&facts_path)?;
+        let mut f = oracle::Facts::read(&facts_path)?;
+        if let Some(r) = resources {
+            f.vanilla_items = read_json(&r.join("items.json"))
+                .inspect_err(|e| log(format!("items patched without the game's tables: {e}")))
+                .unwrap_or_default();
+        }
         log(format!(
             "oracle facts: {} blocks, {} items",
             f.blocks.len(),
@@ -150,7 +160,16 @@ pub fn carry(
         })
         .flatten()
         .collect();
-    let in_pack = |m: &str| in_pack.contains(m);
+    // A namespace two carried mods both claim (a library's they both use, such as YUNG's API's
+    // `yungsapi`, whose own jar isn't read) is neither's: either would refuse the other in the
+    // game. Its files stay outside both.
+    let claims = records.iter().filter(|r| chosen(r)).filter_map(|r| {
+        let (jar, info) = (r.jar.as_ref()?, r.info.as_ref()?);
+        let owned = carry::namespaces_claimed(jar, &info.mod_id, &|m| in_pack.contains(m)).ok()?;
+        Some((r.key.as_str(), owned))
+    });
+    let shared = shared_namespaces(claims, log);
+    let in_pack = |m: &str| in_pack.contains(m) || shared.contains(m);
     let pack = carry::Pack {
         loaded: &loaded,
         mods: &in_pack,
@@ -219,6 +238,61 @@ pub fn carry(
     Ok(done)
 }
 
+/// Which carried-over mods (`mods/<key>/carry` folders) the game loads together, in the order
+/// given: as the game does, the first of two owning one namespace stays on. Returns the ones on,
+/// and a line for each one left off.
+pub fn loadable(mods: &[std::path::PathBuf]) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    let mut on: Vec<(std::path::PathBuf, String, Vec<String>)> = Vec::new();
+    let mut off = Vec::new();
+    for path in mods {
+        let manifest = fs::read_to_string(path.join(horizon_mods::manifest::MANIFEST))
+            .map_err(|e| e.to_string())
+            .and_then(|t| horizon_mods::Manifest::parse(&t));
+        let m = match manifest {
+            Ok(m) => m,
+            Err(e) => {
+                off.push(format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
+        let owned: Vec<String> = std::iter::once(m.id.clone())
+            .chain(m.namespaces.iter().cloned())
+            .collect();
+        let clash = on
+            .iter()
+            .find_map(|(_, id, ns)| horizon_mods::content::clash((id, ns), (&m.id, &owned)));
+        match clash {
+            Some(why) => off.push(format!("{} not loaded: {why}", m.id)),
+            None => on.push((path.clone(), m.id, owned)),
+        }
+    }
+    (on.into_iter().map(|(p, _, _)| p).collect(), off)
+}
+
+/// The namespaces more than one mod claims, from each mod's (key, claimed namespaces).
+fn shared_namespaces<'a>(
+    claims: impl Iterator<Item = (&'a str, Vec<String>)>,
+    log: Log,
+) -> BTreeSet<String> {
+    let mut by_namespace: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for (key, owned) in claims {
+        for ns in owned {
+            by_namespace.entry(ns).or_default().push(key);
+        }
+    }
+    by_namespace
+        .into_iter()
+        .filter(|(_, mods)| mods.len() > 1)
+        .map(|(ns, mods)| {
+            log(format!(
+                "namespace {ns} is claimed by {}: left to none of them",
+                mods.join(", ")
+            ));
+            ns
+        })
+        .collect()
+}
+
 /// The pack's title as the report heads it.
 pub fn title(pack: &import::Pack) -> String {
     format!(
@@ -264,6 +338,7 @@ pub fn port(
         Ok(r) => r,
         Err(_) => inventory(work, false, log)?,
     };
+    crate::resourcepacks::fetch(work, log)?;
     let fetched = fetch::fetch(work, &records, from, &portable, log)?;
     // The jars tell classes and tiers better than metadata alone.
     let records = inventory(work, true, log)?;
@@ -278,4 +353,78 @@ pub fn port(
         carry(work, resources, &only, log)?;
     }
     Ok((fetched, report(work, log)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_resources_without_items_json_still_carry() {
+        let root = std::env::temp_dir().join(format!("port-pack-no-items-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (work, resources) = (root.join("work"), root.join("resources"));
+        fs::create_dir_all(work.join("oracle")).unwrap();
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(work.join("inventory.json"), "[]").unwrap();
+        fs::write(
+            work.join("oracle/facts.json"),
+            r#"{"blocks": {}, "items": {}}"#,
+        )
+        .unwrap();
+        let logged = std::cell::RefCell::new(Vec::new());
+        let log = |line: String| logged.borrow_mut().push(line);
+        assert_eq!(carry(&work, Some(&resources), &[], &log), Ok(0));
+        let logged = logged.borrow();
+        assert!(
+            logged
+                .iter()
+                .any(|l| l.contains("without the game's tables")),
+            "{logged:?}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_namespace_two_mods_claim_is_neither_s() {
+        let claims = [
+            ("betterdungeons", vec!["yungsapi".to_owned()]),
+            ("betterfortresses", vec!["yungsapi".to_owned()]),
+            (
+                "towns_and_towers",
+                vec!["kaisyn".to_owned(), "towns_and_towers".to_owned()],
+            ),
+        ];
+        let shared = shared_namespaces(claims.into_iter(), &|_| {});
+        assert_eq!(shared.into_iter().collect::<Vec<_>>(), ["yungsapi"]);
+    }
+
+    #[test]
+    fn the_first_of_two_mods_owning_a_namespace_loads() {
+        let root = std::env::temp_dir().join(format!("port-pack-loadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let carry = |key: &str, namespaces: &str| {
+            let dir = root.join(key).join("carry");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("horizon-mod.toml"),
+                format!(
+                    "id = \"{key}\"\nname = \"{key}\"\nversion = \"1\"\napi = \"0.2\"\n\
+                     capabilities = [\"registries\"]\nnamespaces = [{namespaces}]\n"
+                ),
+            )
+            .unwrap();
+            dir
+        };
+        let mods = [
+            carry("betterdungeons", "\"yungsapi\""),
+            carry("betterfortresses", "\"yungsapi\""),
+            carry("ruby", ""),
+        ];
+        let (on, off) = loadable(&mods);
+        assert_eq!(on, [mods[0].clone(), mods[2].clone()]);
+        assert_eq!(off.len(), 1);
+        assert!(off[0].starts_with("betterfortresses not loaded"), "{off:?}");
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

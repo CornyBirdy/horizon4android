@@ -27,10 +27,24 @@ pub struct MovingPiston {
     pub progress: f32,
     pub progress_o: f32,
     pub last_ticked: i64,
+    /// `PistonMovingBlockEntity.deathTicks`: on a client the entity waits
+    /// five ticks past progress 1.0 before placing the block itself.
+    pub death_ticks: i32,
     /// Identity of this block entity (a replaced entity is a new ticker).
     pub id: u64,
 }
 impl MovingPiston {
+    /// What collision and rendering need from this block entity.
+    pub fn shape_state(&self) -> crate::piston_shape::MovingPistonState {
+        crate::piston_shape::MovingPistonState {
+            moved_state: self.moved_state,
+            direction: self.direction,
+            extending: self.extending,
+            source: self.source,
+            progress: self.progress,
+            previous_progress: self.progress_o,
+        }
+    }
     pub fn movement_direction(&self) -> Direction {
         if self.extending {
             self.direction
@@ -38,6 +52,25 @@ impl MovingPiston {
             self.direction.opposite()
         }
     }
+}
+
+/// `MovingPistonBlock.getDrops`: a broken moving piston drops as the block its
+/// block entity is moving, and drops nothing when that block entity is gone
+/// (vanilla returns `Collections.emptyList()`). Every other block drops as
+/// itself.
+pub(crate) fn dropped_state(
+    b: &Behaviours,
+    moving: &[(BlockPos, MovingPiston)],
+    state: BlockStateId,
+    pos: BlockPos,
+) -> Option<BlockStateId> {
+    if !b.is_block(state, b.named.moving_piston) {
+        return Some(state);
+    }
+    moving
+        .iter()
+        .find(|(p, _)| *p == pos)
+        .map(|(_, piston)| piston.moved_state)
 }
 
 /// `BlockEventData`.
@@ -115,12 +148,13 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.note_trigger_event(pos, state);
             true
         } else if data.is(super::classes::Class::Bell) {
-            // BellBlockEntity.triggerEvent handles event 1; the server
-            // broadcasts handled events to the clients.
-            if a == 1 {
-                self.emit(LevelEvent::BlockEntityEvent { pos, state, a, b });
-            }
+            // BellBlockEntity.triggerEvent handles event 1; the caller
+            // reports handled events (`runBlockEvents` broadcasts them).
             a == 1
+        } else if data.is(super::classes::Class::PotentSulfur) {
+            // PotentSulfurBlock.triggerEvent: the block entity notes the
+            // eruption's game time (the caller's), and the event is handled.
+            true
         } else {
             false
         }
@@ -153,7 +187,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let Some(piston) = self.moving_piston(pos) else {
             return;
         };
-        if piston.progress_o >= 1.0 {
+        // finalTick: `progressO < 1.0 || level.isClientSide` — a client
+        // finishes its copy even at full progress.
+        if piston.progress_o >= 1.0 && !self.level.is_client_side() {
             return;
         }
         self.remove_moving_piston(pos);
@@ -166,10 +202,13 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             };
             self.set_block_and_update(pos, new);
             let block = b.block(new);
-            self.neighbor_changed_at(pos, block);
+            let orientation = self.initial_orientation(Some(piston.movement_direction()), None);
+            self.neighbor_changed_at_oriented(pos, block, orientation);
         }
     }
-    /// `PistonMovingBlockEntity.tick` (entity pushing excluded).
+    /// `PistonMovingBlockEntity.tick`. A piston that is still moving reports
+    /// the push `moveCollidedEntities` would do at its new progress; the caller
+    /// moves the entities, because `Ticks` has none (`piston_pushes`).
     fn moving_piston_tick(&mut self, pos: BlockPos) {
         let Some(mut piston) = self.moving_piston(pos) else {
             return;
@@ -178,6 +217,20 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         piston.last_ticked = self.level.game_time();
         piston.progress_o = piston.progress;
         if piston.progress_o >= 1.0 {
+            if self.level.is_client_side() && piston.death_ticks < 5 {
+                // The client's copy waits for the server's state before
+                // placing the block itself (deathTicks < 5).
+                piston.death_ticks += 1;
+                if let Some(entry) = self
+                    .ticks
+                    .moving_pistons
+                    .iter_mut()
+                    .find(|(p, _)| *p == pos)
+                {
+                    entry.1 = piston;
+                }
+                return;
+            }
             self.remove_moving_piston(pos);
             if b.is_block(self.state(pos), b.named.moving_piston) {
                 let mut new = self.update_from_neighbour_shapes(piston.moved_state, pos);
@@ -196,18 +249,26 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     }
                     self.set_block(pos, new, 67);
                     let block = b.block(new);
-                    self.neighbor_changed_at(pos, block);
+                    let orientation =
+                        self.initial_orientation(Some(piston.movement_direction()), None);
+                    self.neighbor_changed_at_oriented(pos, block, orientation);
                 }
             }
         } else {
-            piston.progress = (piston.progress + 0.5).min(1.0);
-            if let Some(entry) = self
+            // moveCollidedEntities and moveStuckEntities run with the new
+            // progress but read the old one off the entity (their delta),
+            // so the push carries the piston as it was before the advance.
+            let old = piston;
+            let new_progress = (old.progress + 0.5).min(1.0);
+            let current = self
                 .ticks
                 .moving_pistons
                 .iter_mut()
-                .find(|(p, _)| *p == pos)
-            {
+                .find(|(p, _)| *p == pos);
+            if let Some(entry) = current {
+                piston.progress = new_progress;
                 entry.1 = piston;
+                self.ticks.piston_pushes.push((pos, old, new_progress));
             }
         }
     }
@@ -230,8 +291,13 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             direction != Direction::Down && self.has_signal(rel(up, direction), direction)
         })
     }
-    /// `PistonBaseBlock.checkIfExtend`.
+    /// `PistonBaseBlock.checkIfExtend`, which `neighborChanged`, `onPlace`
+    /// and `setPlacedBy` call only server-side: a client moves its pistons on
+    /// the server's block events alone.
     pub(crate) fn piston_check_if_extend(&mut self, pos: BlockPos, state: BlockStateId) {
+        if self.level.is_client_side() {
+            return;
+        }
         let b = self.b;
         let direction = b.facing(state);
         let extend = self.piston_neighbor_signal(pos, direction);
@@ -298,6 +364,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             return false;
         }
         !b.has_flag(state, super::data::state_flags::BLOCK_ENTITY)
+            && !self.level.has_mod_block_entity(pos)
     }
     fn is_slime_or_honey(&self, state: BlockStateId) -> bool {
         self.b.is_block(state, self.b.named.slime_block)
@@ -482,14 +549,15 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             if sticky { "sticky" } else { "normal" },
         )
     }
-    /// `PistonBaseBlock.moveBlocks`.
+    /// `PistonBaseBlock.moveBlocks`: whether the blocks moved, or None when
+    /// the level refused the move (`LevelAccess::allow_piston_move`).
     fn piston_move_blocks(
         &mut self,
         piston_pos: BlockPos,
         direction: Direction,
         extending: bool,
         sticky: bool,
-    ) -> bool {
+    ) -> Option<bool> {
         let b = self.b;
         let arm = rel(piston_pos, direction);
         if !extending && b.is_block(self.state(arm), b.named.piston_head) {
@@ -498,8 +566,14 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let Some((to_push, to_destroy, push_direction)) =
             self.piston_resolve(piston_pos, direction, extending)
         else {
-            return false;
+            return Some(false);
         };
+        if !self
+            .level
+            .allow_piston_move(piston_pos, push_direction, &to_push, &to_destroy)
+        {
+            return None;
+        }
         let mut delete_after: JavaHashMap<PosKey, BlockStateId> = JavaHashMap::default();
         let mut shapes = Vec::with_capacity(to_push.len());
         for pos in &to_push {
@@ -516,6 +590,12 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         for pos in to_destroy.iter().rev() {
             let state = self.state(*pos);
             self.drop_resources(state, *pos);
+            // The client's copy plays the destroy effect itself (the
+            // server sends no 2001 for piston moves).
+            let fire = b.is_block(state, b.named.fire) || b.is_block(state, b.named.soul_fire);
+            if !fire && self.level.is_client_side() {
+                self.level_event(2001, *pos, state.0 as i32);
+            }
             self.set_block(*pos, b.air(), 18);
             self.game_event(*pos, "minecraft:block_destroy");
             to_update.push(state);
@@ -540,6 +620,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     progress: 0.0,
                     progress_o: 0.0,
                     last_ticked: 0,
+                    death_ticks: 0,
                     id: 0,
                 },
             );
@@ -565,6 +646,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     progress: 0.0,
                     progress_o: 0.0,
                     last_ticked: 0,
+                    death_ticks: 0,
                     id: 0,
                 },
             );
@@ -580,6 +662,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.update_neighbour_shapes(air, *pos, 2, super::flags::UPDATE_LIMIT);
             self.update_indirect_neighbour_shapes(air, *pos, 2, super::flags::UPDATE_LIMIT);
         }
+        let orientation = self.initial_orientation(Some(push_direction), None);
         let mut index = 0;
         for pos in to_destroy.iter().rev() {
             let state = to_update[index];
@@ -587,18 +670,17 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.affect_neighbors_after_removal(state, *pos, false);
             self.update_indirect_neighbour_shapes(state, *pos, 2, super::flags::UPDATE_LIMIT);
             let block = b.block(state);
-            self.update_neighbors_at(*pos, block);
+            self.update_neighbors_at_oriented(*pos, block, orientation);
         }
         for pos in to_push.iter().rev() {
             let block = b.block(to_update[index]);
             index += 1;
-            self.update_neighbors_at(*pos, block);
+            self.update_neighbors_at_oriented(*pos, block, orientation);
         }
         if extending {
-            self.update_neighbors_at(arm, b.named.piston_head);
+            self.update_neighbors_at_oriented(arm, b.named.piston_head, orientation);
         }
-        let _ = push_direction;
-        true
+        Some(true)
     }
     /// `PistonBaseBlock.triggerEvent`.
     fn piston_trigger_event(
@@ -613,16 +695,23 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let direction = b.facing(state);
         let extended_state = b.table.set_bool(state, p.extended, true);
         let sticky = self.is_sticky_piston(state);
-        let extend = self.piston_neighbor_signal(pos, direction);
-        if extend && (a == 1 || a == 2) {
-            self.set_block(pos, extended_state, 2);
-            return false;
-        }
-        if !extend && a == 0 {
-            return false;
+        // A pull the level refused isn't sent: clients, who aren't asked,
+        // would replay it, so they get the blocks' changes instead.
+        let mut refused = false;
+        // The signal re-check is server-only (`!level.isClientSide`): a
+        // client trusts the event as sent.
+        if !self.level.is_client_side() {
+            let extend = self.piston_neighbor_signal(pos, direction);
+            if extend && (a == 1 || a == 2) {
+                self.set_block(pos, extended_state, 2);
+                return false;
+            }
+            if !extend && a == 0 {
+                return false;
+            }
         }
         if a == 0 {
-            if !self.piston_move_blocks(pos, direction, true, sticky) {
+            if self.piston_move_blocks(pos, direction, true, sticky) != Some(true) {
                 return false;
             }
             self.set_block(pos, extended_state, 67);
@@ -653,6 +742,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     progress: 0.0,
                     progress_o: 0.0,
                     last_ticked: 0,
+                    death_ticks: 0,
                     id: 0,
                 },
             );
@@ -686,7 +776,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     {
                         self.remove_block(rel(pos, direction), false);
                     } else {
-                        self.piston_move_blocks(pos, direction, false, sticky);
+                        refused = self
+                            .piston_move_blocks(pos, direction, false, sticky)
+                            .is_none();
                     }
                 }
             } else {
@@ -701,7 +793,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             });
             self.game_event(pos, "minecraft:block_deactivate");
         }
-        true
+        !refused
     }
 
     // ---- PistonHeadBlock ----
@@ -737,8 +829,18 @@ impl Behaviours {
             }
             let mut sim = self.sim(level, ticks);
             let state = sim.state(event.pos);
-            if self.block(state) == event.block {
-                sim.trigger_event(state, event.pos, event.param_a, event.param_b);
+            if self.block(state) == event.block
+                && sim.trigger_event(state, event.pos, event.param_a, event.param_b)
+            {
+                // ServerLevel.runBlockEvents broadcasts a handled event to
+                // the clients (`ClientboundBlockEventPacket`); their copy of
+                // the block re-runs `triggerEvent` (a piston's `moveBlocks`).
+                sim.emit(LevelEvent::BlockEntityEvent {
+                    pos: event.pos,
+                    state,
+                    a: event.param_a,
+                    b: event.param_b,
+                });
             }
         }
         for event in reschedule {
@@ -766,6 +868,87 @@ impl Behaviours {
                 continue;
             }
             self.sim(level, ticks).moving_piston_tick(pos);
+        }
+    }
+    /// `ClientLevel.blockEvent`: the client re-runs the block's
+    /// `triggerEvent` on its own level (a piston's `moveBlocks` builds the
+    /// moving block entities it then animates) instead of waiting for the
+    /// server's states. No queue and no ticking-chunk gate: a client runs
+    /// the event where the packet lands.
+    pub fn client_block_event<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut Ticks,
+        pos: BlockPos,
+        a: i32,
+        b: i32,
+    ) -> bool {
+        let triggered = {
+            let mut sim = self.sim(level, ticks);
+            let state = sim.state(pos);
+            let triggered = sim.trigger_event(state, pos, a, b);
+            if triggered {
+                // The client's copy of a handled event reaches the client
+                // copy of the block entity (a bell's ring).
+                sim.emit(LevelEvent::BlockEntityEvent { pos, state, a, b });
+            }
+            triggered
+        };
+        self.client_drain_block_events(level, ticks);
+        triggered
+    }
+    /// `ClientLevel.tickBlockEntities` for moving pistons: the client copy of
+    /// [`Behaviours::tick_block_entities`], without the server's
+    /// ticking-chunk gate (a client ticks every loaded block entity). One
+    /// whose block was replaced is dropped (`TickingBlockEntity.isRemoved`).
+    pub fn client_tick_block_entities<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut Ticks,
+    ) {
+        let tickers: Vec<(BlockPos, u64)> = ticks
+            .moving_pistons
+            .iter()
+            .map(|(p, m)| (*p, m.id))
+            .collect();
+        for (pos, id) in tickers {
+            if !ticks
+                .moving_pistons
+                .iter()
+                .any(|(p, m)| *p == pos && m.id == id)
+            {
+                continue;
+            }
+            {
+                let mut sim = self.sim(level, ticks);
+                let state = sim.state(pos);
+                if sim.b.is_block(state, sim.b.named.moving_piston) {
+                    sim.moving_piston_tick(pos);
+                } else {
+                    sim.remove_moving_piston(pos);
+                }
+            }
+            self.client_drain_block_events(level, ticks);
+        }
+    }
+    /// Block events a client-side `triggerEvent` queued
+    /// (`PistonBaseBlock.checkIfExtend` in a neighbour update): a client
+    /// runs them as they come (`ClientLevel.blockEvent`), not in a tick pass.
+    fn client_drain_block_events<L: LevelAccess + ?Sized>(&self, level: &mut L, ticks: &mut Ticks) {
+        while let Some(event) = ticks.block_events.first().copied() {
+            ticks.block_events.remove(0);
+            let mut sim = self.sim(level, ticks);
+            let state = sim.state(event.pos);
+            if self.block(state) == event.block
+                && sim.trigger_event(state, event.pos, event.param_a, event.param_b)
+            {
+                sim.emit(LevelEvent::BlockEntityEvent {
+                    pos: event.pos,
+                    state,
+                    a: event.param_a,
+                    b: event.param_b,
+                });
+            }
         }
     }
 }

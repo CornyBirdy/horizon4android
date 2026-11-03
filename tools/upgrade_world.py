@@ -9,20 +9,18 @@ level.dat, player and data/*.dat files) is applied exactly. The original is kept
   upgrade_world.py SOURCE_WORLD DEST_WORLD
 """
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+try:
+    from . import lab
+except ImportError:
+    import lab
+
 ROOT = Path(__file__).resolve().parent.parent
-SERVER = ROOT / '.local' / 'minecraft' / '26.3' / 'jars' / 'server.jar'
-
-
-def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+SERVER = lab.GAME / 'jars' / 'server.jar'
 
 
 def main():
@@ -37,7 +35,7 @@ def main():
         scratch = Path(scratch)
         (scratch / 'eula.txt').write_text('eula=true\n')
         (scratch / 'server.properties').write_text(
-            f'level-name=world\nonline-mode=false\nserver-port={free_port()}\n')
+            f'level-name=world\nonline-mode=false\nserver-port={lab.free_port()}\n')
         shutil.copytree(source, scratch / 'world')
         # The server upgrades at startup, then keeps running as a normal server: stop it
         # once it reports "Done".

@@ -140,6 +140,30 @@ Note: the frame rate, whether it gets hot, whether chunks pop in late.
 
 **23. Leave the game running ten minutes in your hand.** Report how the phone feels, the battery drop, and any crash or the app being killed.
 
+### Online servers
+
+Needs a Microsoft account that owns Minecraft: Java Edition, signed in to the Horizon launcher on the PC. See [Online servers](ANDROID.md#online-servers).
+Do these after step 22, with an online-mode server (a friend's, or your own `horizon-server` with `online-mode=true`) and, for step 26, one that is offline-mode.
+
+**24. The account imports.** On the PC run `android\make-phone-session.bat` (pick your account); send `horizon-session.json` to the phone; on the start screen tap
+**Import a Microsoft account** and pick it. The screen then says "Signed in as <your name>. Valid until <a time about a day ahead>".
+- The script cannot find the launcher: run it with `-Launcher "C:\path\to\horizon-launcher.exe"`. The launcher answers with something other than a session file:
+  send the red message (usually the account needs signing in again in the launcher's Settings).
+- "That file is not a session" / "no name, uuid or access token": send the first 20 characters of the file *without* the token (`{"name":"..."`), never the token.
+
+**25. An online-mode server accepts you.** Start Horizon, Multiplayer, add or direct-connect to the server. You get in under your account's name, with your skin.
+- "Invalid session" / "Failed to log in": the session ran out or is not yours; run step 24 again. Send `latest.log` (it says whether the account was handed to the game:
+  `the imported Microsoft account is handed to the game`; the token is never logged).
+- "This server is in online mode. Import your Microsoft account...": no account was handed over. Check step 24's screen, then `latest.log`.
+- Chat shows "Chat message validation failure" or is refused as unsigned: send the server's version and `latest.log`.
+
+**26. Other servers still work.** Join an offline-mode server (`online-mode=false`), and a server whose address has an SRV record (a hostname without its port that
+redirects elsewhere). Open to LAN from a world on the phone and join it from a PC on the same Wi-Fi.
+- An SRV-redirected hostname does not connect but its real `host:port` does: send the hostname and `latest.log` (the lookup uses 1.1.1.1 and 8.8.8.8 on Android).
+
+**27. Leaving and coming back online.** Join an online server, press Home for a minute, come back: the game reconnects or shows the disconnect screen; **Remove the Microsoft account** on the start
+screen and start again: online-mode servers now refuse you with the import message, offline ones still work.
+
 ## Report template
 
 ```

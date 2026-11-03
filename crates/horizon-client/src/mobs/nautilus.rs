@@ -76,14 +76,6 @@ pub fn finalize(m: &mut Mob, warm_ocean: bool) {
         m.extra.variant = u8::from(warm_ocean);
     }
 }
-/// `checkNautilusSpawnRules`: 5 to 25 blocks below sea level, water below
-/// and above.
-pub fn spawn_rules_ok(w: &MobWorld, x: i32, y: i32, z: i32) -> bool {
-    let sea = 63;
-    (sea - 25..=sea - 5).contains(&y)
-        && w.fluid(x, y - 1, z) == Fluid::Water
-        && w.block_name(x, y + 1, z) == "minecraft:water"
-}
 /// `getControllingPassenger`: a player on a saddled nautilus.
 pub fn controlled(m: &Mob) -> bool {
     m.rider.is_some() && m.extra.saddled
@@ -236,10 +228,42 @@ fn dash(m: &mut Mob, amount: f32) {
     // The sound plays on its next tick.
     m.extra.scratch[1] = 1;
 }
+/// `AbstractNautilus.getNautilusRestrictionRadius`: 32 blocks, or 16 for a
+/// baby or a saddled one.
+fn restriction_radius(m: &Mob) -> i32 {
+    if !m.is_baby() && !m.extra.saddled {
+        32
+    } else {
+        16
+    }
+}
+/// `AbstractNautilus.checkRestriction`: a tame nautilus that is neither
+/// leashed nor ridden keeps its home where it is, within its radius.
+fn check_restriction(m: &mut Mob) {
+    if m.extra.leash.is_some() || m.rider.is_some() || !m.extra.tame {
+        return;
+    }
+    let radius = restriction_radius(m);
+    let at = [
+        m.position.x.floor() as i32,
+        m.position.y.floor() as i32,
+        m.position.z.floor() as i32,
+    ];
+    let kept = m.ai.home.is_some_and(|(c, r)| {
+        let d = [c[0] - at[0], c[1] - at[1], c[2] - at[2]];
+        let sq = f64::from(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        sq < f64::from(radius + 8).powi(2) && r == radius
+    });
+    if !kept {
+        m.ai.home = Some((at, radius));
+    }
+}
 /// `AbstractNautilus.tick` and the brains' memories: the rider's breath, the
 /// dash clock, bubbles, and choosing whom to charge at
 /// (`NautilusAi.findNearestValidAttackTarget`).
 pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
+    // customServerAiStep: the home is kept before the rest of the step.
+    check_restriction(m);
     if m.extra.scratch[1] != 0 {
         m.extra.scratch[1] = 0;
         sound(m, dash_sound(m), events);
@@ -301,21 +325,36 @@ fn bubbles(m: &mut Mob, events: &mut Vec<MobEvent>) {
         f64::from(yaw.cos() * pitch.cos()),
     ];
     let spread = m.random.next_double() * 0.8 * (1.0 + speed);
-    for _ in 0..3 {
-        let _ = (f64::from(m.random.next_float()) - 0.5) * spread;
-    }
-    events.push(MobEvent::Particles {
+    let velocity = [
+        (f64::from(m.random.next_float()) - 0.5) * spread,
+        (f64::from(m.random.next_float()) - 0.5) * spread,
+        (f64::from(m.random.next_float()) - 0.5) * spread,
+    ];
+    events.push(MobEvent::ParticleAt {
         kind: "bubble",
         at: [
             m.position.x - dir[0] * 1.1,
             m.position.y - dir[1] + 0.25,
             m.position.z - dir[2] * 1.1,
         ],
-        count: 1,
+        velocity,
     });
+}
+/// `AbstractNautilus.tick` on a client of a server: the bubbles of a nautilus
+/// in the water, from the motion the server sent.
+pub fn client_tick(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    if m.fluids.in_water {
+        bubbles(m, events);
+    }
 }
 fn in_water_at(w: &MobWorld, p: Vec3) -> bool {
     w.fluid(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32) == Fluid::Water
+}
+/// `AbstractNautilus.isAggravated`: the brain holds an `ANGRY_AT` or an
+/// `ATTACK_TARGET` memory. Horizon keeps those as the anger timer (whose
+/// target is `last_hurt_by`) and the current attack target.
+pub fn aggravated(m: &Mob) -> bool {
+    m.extra.anger > 0 || m.ai.target.is_some()
 }
 /// `NautilusAi.findNearestValidAttackTarget`: whoever it is angry at, else
 /// now and then (a coin flip every 2400 to 3600 ticks) the nearest pufferfish.
@@ -464,14 +503,16 @@ impl Goal for Charge {
         let factor = (self.speed as f32 * m.movement_speed() as f32).clamp(0.2, 2.0) + boost;
         let power = f64::from(factor * 2.0);
         if power > 0.0 {
-            let yaw = m.yaw.to_radians();
-            cx.events.push(MobEvent::Push {
+            // `causeExtraKnockback`: `LivingEntity.knockback` on the target, away
+            // from (sin(yaw), -cos(yaw)): its resistance, the halving of its own
+            // motion, the lift on the ground and the knockback hook all apply.
+            let yaw = f64::from(m.yaw * (std::f32::consts::PI / 180.0));
+            cx.events.push(MobEvent::Knockback {
                 target: who,
-                velocity: [
-                    -f64::from(yaw.sin()) * power,
-                    0.0,
-                    f64::from(yaw.cos()) * power,
-                ],
+                power,
+                x: f64::from(horizon_core::geometry::trig::sin(yaw)),
+                z: -f64::from(horizon_core::geometry::trig::cos(yaw)),
+                source: super::Damage::mob(m.id, from),
             });
             m.velocity = Vec3::new(m.velocity.x * 0.6, m.velocity.y, m.velocity.z * 0.6);
         }
@@ -534,11 +575,6 @@ pub fn to_nbt(m: &Mob, map: &mut horizon_world::nbt::Compound) {
         map.remove(&"Owner".into());
     }
     map.insert("Sitting".into(), Tag::Byte(0));
-    // AgeableMob and Animal (a water creature is not saved with them above).
-    map.insert("Age".into(), Tag::Int(m.extra.age));
-    map.insert("AgeLocked".into(), Tag::Byte(i8::from(m.extra.age_locked)));
-    map.insert("InLove".into(), Tag::Int(m.extra.in_love.max(0)));
-    map.entry("ForcedAge".into()).or_insert(Tag::Int(0));
     if zombie(m) {
         let v = VARIANTS[usize::from(m.extra.variant).min(1)];
         map.insert(
@@ -572,14 +608,6 @@ pub fn to_nbt(m: &Mob, map: &mut horizon_world::nbt::Compound) {
 }
 pub fn from_nbt(m: &mut Mob, tag: &horizon_world::nbt::Tag) {
     use horizon_world::nbt::Tag;
-    let int = |k: &str| match tag.get(k) {
-        Some(Tag::Int(v)) => Some(*v),
-        Some(Tag::Byte(v)) => Some(i32::from(*v)),
-        _ => None,
-    };
-    m.extra.age = int("Age").unwrap_or(0);
-    m.extra.age_locked = int("AgeLocked").unwrap_or(0) != 0;
-    m.extra.in_love = int("InLove").unwrap_or(0);
     m.extra.owner = crate::save::uuid_from_tag(tag.get("Owner"));
     m.extra.tame = m.extra.owner.is_some();
     if let Some(Tag::String(v)) = tag.get("variant") {
@@ -598,5 +626,58 @@ pub fn from_nbt(m: &mut Mob, tag: &horizon_world::nbt::Tag) {
         .and_then(|b| b.get("value"))
     {
         m.extra.counter = *v;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mobs::world::with_test_world;
+    use std::sync::Arc;
+
+    /// `ChargeAttack.dealKnockBack` is `causeExtraKnockback`: `LivingEntity.knockback`
+    /// on the target, away from (sin(yaw), -cos(yaw)), not a raw push of its motion.
+    #[test]
+    fn a_charge_knocks_its_target_back_along_its_facing() {
+        let mut events = Vec::new();
+        let ran = with_test_world(&[], |w, types| {
+            let mut w = w.clone();
+            let at = Vec3::new(0.5, 64.0, 0.5);
+            w.player = Some(crate::mobs::world::test_player(at));
+            let mut m = Mob::new(
+                1,
+                Arc::new(types.types["minecraft:nautilus"].clone()),
+                Vec3::new(0.5, 64.0, 0.2),
+                0.0,
+            );
+            m.ai.target = Some(Who::Player);
+            let mut goal = Charge::new(0.5);
+            let mut lr = horizon_core::random::LegacyRandom::new(1);
+            let mut cx = Cx {
+                w: &w,
+                lr: &mut lr,
+                events: &mut events,
+            };
+            goal.tick(&mut m, &mut cx);
+        });
+        if !ran {
+            return;
+        }
+        let knock = events.iter().find_map(|e| match e {
+            MobEvent::Knockback {
+                target,
+                power,
+                x,
+                z,
+                ..
+            } => Some((*target, *power, *x, *z)),
+            _ => None,
+        });
+        let (target, power, x, z) = knock.expect("the charge knocks its target back");
+        assert_eq!(target, Who::Player);
+        assert!(power > 0.0);
+        // It turns to the target, which is straight ahead at +z (yaw 0): sin = 0, -cos = -1.
+        assert!(x.abs() < 1e-3 && (z + 1.0).abs() < 1e-3, "{x} {z}");
+        assert!(!events.iter().any(|e| matches!(e, MobEvent::Push { .. })));
     }
 }

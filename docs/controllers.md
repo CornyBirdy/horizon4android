@@ -21,11 +21,14 @@ design for any new screen.
 libudev for hot-plugging), IOKit on macOS, Windows.Gaming.Input on Windows.
 Its SDL mapping database normalizes every pad to one positional layout
 (South/East/West/North face buttons, bumpers, triggers, sticks, D-pad,
-Select/Start). No second windowing or event stack: gilrs is polled once per
-loop iteration next to winit's events.
+Select/Start). Horizon also injects a few SDL rows gilrs' bundled DB still
+misses (notably the 8BitDo Ultimate 2 on Linux/Bluetooth, whose right stick
+is on ABS_Z/ABS_RX without that row), and corrects that pad by vendor/product
+when no SDL row matched. No second windowing or event stack: gilrs is polled
+once per loop iteration next to winit's events.
 
 - The pure logic (mapping table, deadzones and curves, button edges, the
-  settings file, glyph choice) lives in `crates/horizon-client/src/gamepad.rs`
+  settings file, glyph choice) lives in `crates/horizon-client-input/src/gamepad.rs`
   and is unit-tested. The game owns a thin gilrs backend and applies actions.
 - Controller actions go through the same path a keyboard key takes after
   rebinding: an action names a vanilla key mapping (`key.jump`, `key.attack`,
@@ -36,7 +39,10 @@ loop iteration next to winit's events.
   move vector directly (a half-tilted stick walks slowly, like Bedrock),
   instead of being rounded to WASD. The forward/back/left/right flags other
   code reads (sprint start, boats, minecarts, the server's input packet) are
-  set when the stick passes a threshold.
+  set when the stick passes a threshold. On a server (not this game's own
+  server thread) the stick moves as those keys do, in 8 directions at full
+  speed, as the server only hears the keys: an anticheat predicting from them
+  pulls back a player moving at the stick's own angle and speed.
 - The pad last touched is the active one. Several pads are not merged.
 - `horizon-ctl pad ...` injects a virtual pad (buttons, sticks, triggers) into
   a running game, for tests without hardware.
@@ -65,8 +71,9 @@ loop iteration next to winit's events.
 
 The Guide / PS / Steam button is left to the system. Sneak on a stick click
 toggles by default (holding a stick in while steering the camera is
-awkward, which is why Bedrock does the same); the controls options can make it
-hold-to-sneak.
+awkward, which is why Bedrock does the same) and acts like vanilla's toggle
+crouch: a screen stands you up while it is open and closing it crouches you
+again. The controls options can make it hold-to-sneak.
 
 ## Menus and inventories
 
@@ -97,9 +104,8 @@ real mouse hands control back at once.
 
 Every interactive rectangle a screen draws registers itself as a focus
 target with its kind (`widgets::target_as`): classic buttons, sliders, edit
-boxes and list rows (worlds, servers, languages), every Horizon-style widget
-(`ui_theme::Ui::interact`: sidebar items, switches, segments, sliders,
-fields, buttons), inventory and container slots, creative and recipe-book
+boxes and list rows (worlds, servers, languages), icon buttons (the title's
+and pause menu's Friends button), inventory and container slots, creative and recipe-book
 tabs, and the stations' own buttons (trades, loom patterns, beacon effects,
 enchantments, stonecutter recipes, the recipe book's recipes, pages and
 filter). A screen that registers nothing falls back to the pointer.
@@ -137,16 +143,77 @@ the crafting result, armour to the player's grid.
 - **Where focus lands** when a screen opens: the held hotbar slot in an
   inventory, else the first button.
 
-How it looks follows the menu style:
+It looks as vanilla's own keyboard focus does: buttons, sliders and slots
+show their highlighted sprite (`isHoveredOrFocused`, drawn because the hidden
+pointer is over them), and list rows and text fields get vanilla's white
+one-pixel outline (`AbstractSelectionList`'s focused selection, `EditBox`'s
+highlighted border).
 
-- **Classic screens** look as vanilla's own keyboard focus does: buttons,
-  sliders and slots show their highlighted sprite (`isHoveredOrFocused`,
-  drawn because the hidden pointer is over them), and list rows and text
-  fields get vanilla's white one-pixel outline (`AbstractSelectionList`'s
-  focused selection, `EditBox`'s highlighted border).
-- **Horizon-style screens** get the design system's focus colour: a two-dp
-  ring in the accent colour around the focused widget, pill-shaped on
-  buttons, tabs and sliders.
+### Keyboard
+
+Vanilla's own keyboard focus navigation (`Screen.keyPressed`, 26.3) uses the
+same focus, so it works with no controller and with controllers turned off
+(`game/key_focus.rs` decides, `game/pad_menu.rs` applies it, and
+`game/startup_menu.rs` on the title shown while resources load). It matters
+most for the narrator: the focused widget is the narration's focused one.
+
+| Key | Does |
+|---|---|
+| Tab / Shift+Tab | next / previous widget in tab order, wrapping (`TabNavigation`) |
+| Arrows | the widget that way (`ArrowNavigation`, the step above; past a list's last visible row the list scrolls) |
+| Enter, Space, keypad Enter | press the focused button, cycle button, checkbox or tab (`AbstractButton.keyPressed`: a click on it, with its sound) |
+
+- **Sliders** (`AbstractSliderButton`): focused with Tab or a click, left
+  and right change the value (one pixel per press, `1 / (width - 8)`);
+  focused with an arrow they move the focus until Enter lets them change
+  it. Enter toggles that. Up and down always move the focus.
+- **Text fields** keep left and right for their caret (`EditBox.keyPressed`),
+  and Enter and Space for themselves; Tab, up and down leave them. Focus
+  landing on a field focuses it with the caret at the end; leaving it
+  unfocuses it (title screens).
+- **Lists**: a list's rows are one Tab stop (Tab enters on its first row,
+  Shift+Tab on its last, the next Tab leaves); up and down move between rows.
+  On the world list focus selects the row and Enter joins it, as vanilla;
+  on other lists Enter clicks the row (selects it, or joins the selected
+  server).
+- With nothing focused, Enter and Space go to the screen (the world list's
+  Enter joins the selected world) and an arrow starts from the screen's
+  edge behind it. A click focuses what it lands on (`mouseClicked`), so the
+  next Tab or arrow goes on from there.
+- A new screen opened by a key starts on its first widget in tab order
+  (`Screen.setInitialFocus`); one opened from the game has no focus.
+- The keyboard doesn't reach inventory slots or the creative and recipe-book
+  tabs (vanilla's screens don't focus them): in container screens only
+  their buttons (the recipe book button, trades, beacon effects).
+- Screens that keep the keys: chat (Tab completes commands), signs, books
+  being written, the creative, recipe-book and mod searches, the anvil's
+  name, command blocks, dialogs, a key or button being bound on Controls,
+  the credits, the on-screen keyboard.
+
+It looks as vanilla's keyboard focus does: the focused widget draws its
+highlighted sprite, and rows and fields the white outline (as above). As
+for the pad, the screens draw their highlight from the pointer, so the focus
+puts Horizon's pointer (not the OS one, which stays where the mouse left it
+and stays visible) on the focused widget, and Enter is a click there. Moving
+the mouse hands the pointer back; a click or a scroll first puts it back
+where the mouse is.
+
+Approximations:
+
+- **Tab order** is reading order (top to bottom, then left to right), not
+  vanilla's add order (`children()` by `getTabOrderGroup`). Horizon has no
+  widget tree, and a screen's buttons and other targets are registered
+  separately, so their draw order isn't one sequence; vanilla's layouts add
+  widgets row by row, which reading order follows.
+- Tab visits the visible widgets only (a scrolled-away options row is
+  reached with the arrows, which scroll); a list is entered on its first or
+  last visible row, not its selected one.
+- A focused slider whose arrows don't change it yet shows the hovered look,
+  not vanilla's highlighted track.
+- The widget under the real mouse isn't highlighted while the keyboard has
+  the pointer (vanilla highlights both).
+- The narration reads a slider's `canChangeValue` from the input type, so
+  Enter sets the input type to match.
 
 ### Pointer
 
@@ -183,8 +250,8 @@ Steam + X opens it at any time. "On-Screen Keyboard: Auto / Horizon / Steam"
 Both modes reach every screen through the pointer events. Focus mode
 registers targets on: the title menus (main, world list and its search, create
 and edit world, delete, multiplayer list and its edit screens), every options
-page (classic pages and the Horizon-style sections, key and controller binds,
-language list), pause, death, chat, signs and books (their buttons), the
+page (vanilla's and Horizon Settings with the pages it opens, key and
+controller binds, language list), pause and Play with Friends, death, chat, signs and books (their buttons), the
 survival and creative inventories, every container and station (chests,
 furnaces, brewing, crafter, crafting table with its recipe book, anvil,
 grindstone, smithing, stonecutter, loom, cartography, enchanting, beacon,
@@ -212,8 +279,10 @@ hints, "Press X to dismount") only while the pad is the last-used input.
 
 ## Options and remapping
 
-Controller settings are Horizon's own and live in `horizon-controller.txt`
-next to `options.txt`, like `horizon-graphics.txt`: `options.txt` stays
+Controller settings are Horizon's own: **Options → Controls → Controller
+Settings...** (or **Options → Horizon Settings... → Controller Settings...**),
+a vanilla options list with **Controller Binds...** at the top. They live in
+`horizon-controller.txt` next to `options.txt`, like `horizon-graphics.txt`: `options.txt` stays
 exactly vanilla's, so a vanilla client can share the game folder.
 
 ```
@@ -490,8 +559,8 @@ The first round (input layer, menus, glyphs and options, rumble) shipped in
 PRs #120, #129, #145 and #149. The second round, each shippable alone:
 
 1. **Focus navigation** (this section above): the menu navigation option,
-   focus targets and vanilla's arrow-key step, the focus highlight in both
-   menu styles, the on-screen keyboard.
+   focus targets and vanilla's arrow-key step, vanilla's focus highlight,
+   the on-screen keyboard.
 2. **Button prompts**: contextual hints with the pad's glyphs in menus and
    optionally in game, and rebinding from them.
 3. **DualSense output** (above): the HID output layer and rumble through it

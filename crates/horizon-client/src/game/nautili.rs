@@ -67,9 +67,11 @@ impl Game<'_> {
             self.nautilus_sound(index, sound);
             return true;
         }
-        // Shift-use on a tame one opens its (saddle and armour) screen.
+        // AbstractNautilus.mobInteract: shift + use on a tame adult opens its
+        // saddle and armour screen (openCustomInventoryScreen).
         if tame && sneaking {
-            return false;
+            self.open_mount_menu(index);
+            return true;
         }
         if !item.is_empty() {
             if !tame && food {
@@ -85,13 +87,8 @@ impl Game<'_> {
                     m.ai.target = None;
                 }
                 let sound = nautilus::eat_sound(m);
-                let kind = if tamed { "heart" } else { "smoke" };
                 // TamableAnimal.spawnTamingParticles (entity event 7 or 6).
-                self.particles_around_mob(
-                    self.mobs[index].id,
-                    kind,
-                    horizon_client::particles::Burst::TAMING,
-                );
+                self.mob_event_particles(self.mobs[index].id, if tamed { 7 } else { 6 });
                 self.nautilus_sound(index, sound);
                 if tamed {
                     let view = self.mob_entity(&self.mobs[index]);
@@ -104,7 +101,7 @@ impl Game<'_> {
                 // feed(player, hand, stack, 2, 1).
                 let sound = nautilus::eat_sound(m);
                 let m = &mut self.mobs[index];
-                m.health = (m.health + 2.0).min(m.attrs.max_health);
+                m.heal(2.0);
                 self.use_nautilus_food(item);
                 self.nautilus_sound(index, sound);
                 return true;
@@ -130,6 +127,9 @@ impl Game<'_> {
         if tame && !food {
             // doPlayerRide.
             let id = self.mobs[index].id;
+            if !self.native_may_board(id) {
+                return true;
+            }
             self.break_leash(id, true, false);
             self.yaw = self.mobs[index].yaw;
             self.riding = Some(id);
@@ -143,8 +143,14 @@ impl Game<'_> {
             m.extra.in_love = 600;
             m.extra.love_player = true;
             let sound = nautilus::eat_sound(m);
+            let id = m.id;
+            self.love_cause.insert(id, self.lan_acting);
+            let kind = self.mobs[index].kind.id.clone();
+            self.native_entity_enter_love_mode(id, &kind, self.lan_acting_uuid);
             self.use_nautilus_food(item);
             self.nautilus_sound(index, sound);
+            // Animal.setInLove: entity event 18.
+            self.mob_event_particles(self.mobs[index].id, 18);
             return true;
         }
         false

@@ -4,7 +4,7 @@
 Vanilla side: VanillaChunkGenerationOracle drives the actual ChunkGenerator
 stages (structure starts and references, biomes, terrain with surface and
 carvers, then biome decoration with every placed feature and structure piece)
-through real WorldGenRegion instances. Horizon side: the chunk_dump example
+through real WorldGenRegion instances. Horizon side: the chunk_dump probe
 runs the same stages in the same order. Every block state, quart biome and
 block entity (canonical NBT) of each target chunk is compared.
 
@@ -40,7 +40,7 @@ SEEDS = [12345, -7046029254386353131, 987654321987, 4242, -1, 0x5DEECE66D, 20260
 REGRESSIONS = [
     (-1860902098141295193, 'the_nether', '-1,6,3,9', 'bastion_remnant across 20 chunks (#249)'),
 ]
-RESOURCES = lab.LOCAL / 'horizon-client/26.3'
+RESOURCES = lab.RESOURCES
 ORACLE = lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity/VanillaChunkGenerationOracle.java'
 
 
@@ -66,14 +66,18 @@ class Oracle:
                                  'dev.horizonlab.parity.VanillaChunkGenerationOracle', *map(str, [args[0], out, *args[1:]])],
                                 capture_output=True, text=True, env=dict(os.environ))
         if result.returncode:
-            lines = [l for l in (result.stdout + result.stderr).splitlines() if 'Exception' in l or 'Caused' in l or '\tat ' in l]
-            raise SystemExit('oracle failed: ' + ' | '.join(lines[:10]))
+            output = (result.stdout + result.stderr).splitlines()
+            lines = [l for l in output if 'Exception' in l or 'Caused' in l or '\tat ' in l]
+            # A JVM that dies without an exception (killed for memory, no heap to reserve) has none of those lines:
+            # say how it ended and show its last output, or the failure reads as an empty message.
+            how = f'exit {result.returncode}' + (' (killed by signal %d)' % -result.returncode if result.returncode < 0 else '')
+            raise SystemExit(f'oracle failed ({how}): ' + ' | '.join(lines[:10] or output[-10:]))
 
 
 def rust_binary():
-    subprocess.run(['cargo', 'build', '--release', '-q', '-p', 'horizon-world', '--example', 'chunk_dump'], check=True, cwd=lab.ROOT)
+    subprocess.run(['cargo', 'build', '--release', '-q', '-p', 'horizon-world', '--example', 'world_probe'], check=True, cwd=lab.ROOT)
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=lab.ROOT, text=True))
-    return Path(metadata['target_directory']) / 'release/examples/chunk_dump'
+    return Path(metadata['target_directory']) / 'release/examples/world_probe'
 
 
 def run_rust(binary, out, seed, dimension, rects, scan=False):
@@ -81,7 +85,7 @@ def run_rust(binary, out, seed, dimension, rects, scan=False):
     if scan:
         env['HORIZON_SCAN'] = '1'
     with open(out, 'w') as handle:
-        result = subprocess.run([str(binary), str(RESOURCES), str(seed), dimension, *rects], stdout=handle, stderr=subprocess.PIPE, text=True, env=env, cwd=lab.ROOT)
+        result = subprocess.run([str(binary), 'chunk_dump', str(RESOURCES), str(seed), dimension, *rects], stdout=handle, stderr=subprocess.PIPE, text=True, env=env, cwd=lab.ROOT)
     if result.returncode:
         raise SystemExit('chunk_dump failed: ' + result.stderr[-2000:])
     return result.stderr
@@ -93,7 +97,7 @@ def parse(path):
         if line.startswith('chunk '):
             _, x, z = line.split()
             current = (int(x), int(z))
-            chunks[current] = {'q': {}, 'y': {}, 'be': {}, 't': []}
+            chunks[current] = {'q': {}, 'y': {}, 'be': {}, 't': [], 'p': []}
         elif line.startswith('q '):
             _, q, row = line.split(' ', 2)
             chunks[current]['q'][int(q)] = row
@@ -102,6 +106,8 @@ def parse(path):
             chunks[current]['y'][int(y)] = row
         elif line.startswith('t '):
             chunks[current]['t'].append(line[2:])
+        elif line.startswith('p '):
+            chunks[current]['p'].append(line[2:])
         elif line.startswith('be '):
             head, *forms = line.split('\t')
             parts = head.split(' ')
@@ -241,6 +247,17 @@ def compare(vanilla, rust, names, label, limit=6, quiet=False):
             first = next((i for i, (u, v) in enumerate(zip(ta, tb)) if u != v), min(len(ta), len(tb)))
             block_diffs.append((pos[0] * 16, 0, pos[1] * 16, f'{len(ta)} ticks, #{first}: {ta[first] if first < len(ta) else "-"}',
                                 f'{len(tb)} ticks, #{first}: {tb[first] if first < len(tb) else "-"}'))
+        # Postprocessing marks: their fluids tick and their blocks are reshaped once the chunk is live.
+        if a.get('p', []) != b.get('p', []):
+            pa, pb = a.get('p', []), b.get('p', [])
+            first = next((i for i, (u, v) in enumerate(zip(pa, pb)) if u != v), min(len(pa), len(pb)))
+            extra = Counter(pb) - Counter(pa)
+            missing = Counter(pa) - Counter(pb)
+            block_diffs.append((pos[0] * 16, 0, pos[1] * 16,
+                                f'{len(pa)} postprocessing marks, #{first}: {pa[first] if first < len(pa) else "-"}'
+                                f' ({sum(missing.values())} not in Horizon, e.g. {next(iter(missing), "-")})',
+                                f'{len(pb)} marks, #{first}: {pb[first] if first < len(pb) else "-"}'
+                                f' ({sum(extra.values())} not in vanilla, e.g. {next(iter(extra), "-")})'))
         if block_diffs or biome_diffs or entity_diffs:
             chunks += 1
             blocks += len(block_diffs)

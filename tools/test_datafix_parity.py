@@ -9,7 +9,7 @@ generated automatically when missing), two upgrades run on a copy:
   vanilla  VanillaDataFixOracle: FileFixerUpper, then DataFixers on level.dat, every
            chunk, entity chunk and POI chunk, player, saved data, advancements and
            statistics file, exactly as 26.3 does when it opens the world
-  horizon  the `datafix_world` example of horizon-world, which does the same with
+  horizon  the `datafix_world` probe of horizon-world, which does the same with
            horizon_world::datafix
 
 Then every file is compared: region files chunk by chunk, NBT files and JSON
@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import anvil_dump  # noqa: E402
+import parity_shard  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 LOCAL = ROOT / '.local' / 'datafix'
@@ -45,7 +46,7 @@ PARITY_SHARDS = 6
 PARITY_RUST_SCOPE = [
     'crates/horizon-world/src/datafix/', 'crates/horizon-world/src/nbt.rs', 'crates/horizon-world/src/region.rs',
     'crates/horizon-world/src/compression.rs', 'crates/horizon-core/src/position.rs', 'crates/horizon-core/src/position/',
-    'crates/horizon-core/src/geometry/',
+    'crates/horizon-core/src/geometry/', 'crates/horizon-core/src/version.rs',
 ]
 
 IGNORED = {
@@ -63,7 +64,7 @@ def java_classpath():
     import test_model_baking_parity as baking
     lock, jars, _ = base.verify_artifacts()
     libraries = baking.client_libraries()
-    build = LOCAL / 'build' / os.environ.get('PARITY_SHARD', 'all').replace('/', '-')  # shards compile apart
+    build = LOCAL / 'build' / parity_shard.label()  # shards compile apart
     build.mkdir(parents=True, exist_ok=True)
     classes, dependencies, _ = harness.compile_oracle(build, 'VanillaDataFixOracle', jars, libraries,
                                                       lock['minecraft']['java_major'])
@@ -71,36 +72,33 @@ def java_classpath():
 
 
 def build_rust():
-    subprocess.run(['cargo', 'build', '--locked', '--release', '-p', 'horizon-world', '--example', 'datafix_world'],
+    subprocess.run(['cargo', 'build', '--locked', '--release', '-p', 'horizon-world', '--example', 'world_probe'],
                    cwd=ROOT, check=True)
     meta = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'],
                                               cwd=ROOT))
-    return Path(meta['target_directory']) / 'release' / 'examples' / 'datafix_world'
-
-
-def shard(items):
-    """This run's share of items when tools/parity.py runs the harness in parts (PARITY_SHARD=i/n)."""
-    spec = os.environ.get('PARITY_SHARD')
-    if not spec:
-        return items
-    index, count = map(int, spec.split('/'))
-    return items[index - 1::count]
+    return Path(meta['target_directory']) / 'release' / 'examples' / 'world_probe'
 
 
 def run_vanilla(classpath, world, out, target=None):
     # The oracle replaces OUT itself: left in place, an unchanged run's outputs can be reused.
     log = out.parent / (out.name + '.log')
     with log.open('w') as f:
-        subprocess.run(['java', '-Xmx3g', '-Djava.awt.headless=true', '-cp', classpath,
-                        'dev.horizonlab.parity.VanillaDataFixOracle', str(world), str(out), *([str(target)] if target else [])],
-                       check=True, stdout=f, stderr=subprocess.STDOUT)
+        result = subprocess.run(['java', '-Xmx3g', '-Djava.awt.headless=true', '-cp', classpath,
+                                 'dev.horizonlab.parity.VanillaDataFixOracle', str(world), str(out), *([str(target)] if target else [])],
+                                stdout=f, stderr=subprocess.STDOUT)
+    if result.returncode:
+        # The traceback of a failed check names the command, not why the JVM stopped: show its exit and last output.
+        how = f'exit {result.returncode}' + (' (killed by signal %d)' % -result.returncode if result.returncode < 0 else '')
+        tail = '\n'.join(log.read_text(errors='replace').splitlines()[-20:])
+        raise SystemExit(f'the vanilla oracle failed on {world.name} ({how}); the end of {log}:\n{tail}')
 
 
 def run_horizon(binary, world, out, target=None):
     shutil.rmtree(out, ignore_errors=True)
     log = out.parent / (out.name + '.log')
     with log.open('w') as f:
-        subprocess.run([str(binary), str(world), str(out), *([str(target)] if target else [])], check=True, stdout=f, stderr=subprocess.STDOUT)
+        subprocess.run([str(binary), 'datafix_world', str(world), str(out), *([str(target)] if target else [])], check=True,
+                       stdout=f, stderr=subprocess.STDOUT)
 
 
 # ---------------------------------------------------------------- comparison
@@ -209,15 +207,15 @@ def main():
     p.add_argument('versions', nargs='*')
     p.add_argument('--keep', action='store_true')
     p.add_argument('--vanilla-only', action='store_true', help='only run the oracle')
-    p.add_argument('--binary', help='a prebuilt datafix_world example')
+    p.add_argument('--binary', help='a prebuilt horizon-world probe binary')
     p.add_argument('--band', type=int, metavar='TARGET', help='check the data fixes up to this DataVersion only (not the '
                    'file fixes), on the sample worlds saved before it, for developing the fixes of a range of versions')
     args = p.parse_args()
     import datafix_worlds
-    import fcntl
+    import file_lock
     WORLDS.parent.mkdir(parents=True, exist_ok=True)
-    with open(WORLDS.parent / 'generate.lock', 'w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # another worktree may be generating them
+    with open(WORLDS.parent / 'generate.lock', 'w') as handle:
+        file_lock.lock(handle)  # another worktree may be generating them
         missing = [v for v in [*datafix_worlds.VERSIONS, *datafix_worlds.VARIANTS] if not (datafix_worlds.worlds_dir(v) / v / 'level.dat').exists()]
         if missing:
             print('generating sample worlds:', ' '.join(missing), flush=True)
@@ -226,7 +224,7 @@ def main():
     band = args.band
     if band and not args.versions:  # worlds in the layout of before 1.16, saved before the target
         worlds = [w for w in worlds if json.loads((world_path(w) / 'datafix-source.json').read_text())['data_version'] < band]
-    versions = shard(args.versions or worlds)
+    versions = parity_shard.shard(args.versions or worlds)
     classpath = java_classpath()
     binary = None if args.vanilla_only else Path(args.binary) if args.binary else build_rust()
     total = 0

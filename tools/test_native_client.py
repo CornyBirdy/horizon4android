@@ -43,10 +43,12 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     report = root / 'startup-smoke.json'
     report.unlink(missing_ok=True)
-    resources = resource_fingerprint(root / '26.3')
+    resources = resource_fingerprint(root / lab.VERSION)
     sources = [lab.ROOT / 'Cargo.toml', lab.ROOT / 'Cargo.lock', Path(__file__).resolve(),
                lab.ROOT / 'crates/horizon-client/Cargo.toml', lab.ROOT / 'crates/horizon-assets/Cargo.toml',
                *sorted((lab.ROOT / 'crates/horizon-client/src').rglob('*')),
+               lab.ROOT / 'crates/horizon-client-render/Cargo.toml',
+               *sorted((lab.ROOT / 'crates/horizon-client-render/src').rglob('*')),
                *sorted((lab.ROOT / 'crates/horizon-assets/src').rglob('*.rs'))]
     oracle = lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity/VanillaGallerySelectionOracle.java'
     helper = oracle.with_name('VanillaCuboidModelOracle.java')
@@ -71,7 +73,7 @@ def main():
         str(executable), '--radius', '1', '--frames', '30',
         '--smoke-report', str(report), '--timeout-seconds', '60']
     with (root / 'startup-smoke.log').open('w') as log:
-        subprocess.run(command, cwd=lab.ROOT, env=environment, check=True,
+        subprocess.run(command, cwd=lab.ROOT, env=lab.game_env(environment), check=True,
                        stdout=log, stderr=subprocess.STDOUT, timeout=120)
     result = json.loads(report.read_text())
     if (result.get('error') is not None or result.get('presented_frames') != 30
@@ -91,7 +93,7 @@ def main():
                         '-d', str(classes), str(oracle), str(helper), str(heightmap)], cwd=lab.ROOT, check=True,
                        stdout=log, stderr=subprocess.STDOUT, timeout=3600)
         subprocess.run(['java', '-Xmx512M', '-cp', str(classes)+os.pathsep+dependencies,
-                        'dev.horizonlab.parity.VanillaGallerySelectionOracle', str(report), str(native), str(root/'26.3')],
+                        'dev.horizonlab.parity.VanillaGallerySelectionOracle', str(report), str(native), str(root / lab.VERSION)],
                        cwd=lab.ROOT, check=True, stdout=log, stderr=subprocess.STDOUT, timeout=3600)
     native_result = json.loads(native.read_text())
     selections = native_result['gallery']
@@ -103,12 +105,12 @@ def main():
                                   'client_jar_sha256': lab.digest(jars['client'], 'sha256'),
                                   'output_sha256': lab.digest(native, 'sha256'),
                                   'scope': 'Actual native registry states, blockstate dispatch, tagged root baking and legacy collection using state.getSeed(position). All 16 featured placements match model names/transforms. An independently constructed native scene also matches total occupied blocks and visible/culled model faces using native parent resolution, rotated culling directions and Block.shouldRenderFace. No shader/pixel parity claim.'}
-    if resource_fingerprint(root / '26.3') != resources:
+    if resource_fingerprint(root / lab.VERSION) != resources:
         raise RuntimeError('Resources changed during native client verification')
     result['resource_files'] = resources
     result['executable_sha256'] = lab.digest(executable, 'sha256')
     result['resource_manifest_sha256'] = lab.digest(
-        root / '26.3/horizon-resources.json', 'sha256')
+        root / lab.VERSION / 'horizon-resources.json', 'sha256')
     actual_sources = {str(path.relative_to(lab.ROOT)): lab.digest(path, 'sha256') for path in sources if path.is_file()}
     if actual_sources != tested_sources:
         raise RuntimeError('Sources changed during native client verification')

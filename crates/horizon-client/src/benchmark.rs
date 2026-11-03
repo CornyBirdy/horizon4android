@@ -116,6 +116,39 @@ impl Control {
     }
 }
 
+/// The wait before a scene's flight, spent timing Horizon's own render passes on the GPU:
+/// `gpu_pass.<scene>.<pass>_ms`, where a slow GPU spends its frame. The timing is off again for
+/// the flight, whose frames it would slow. False, having waited for nothing, on Metal: its passes
+/// overlap on the GPU, so their times add up to more than the frame.
+fn time_passes(control: &Control, scene: &str, report: &mut Report) -> Result<bool, String> {
+    if report
+        .hardware
+        .gpu
+        .as_ref()
+        .is_some_and(|g| g.backend == "metal")
+    {
+        return Ok(false);
+    }
+    control.call("gpu-passes on")?;
+    let held = control.call(&format!("bench {}", SETTLE.as_secs_f64()));
+    control.call("gpu-passes off")?;
+    for (pass, ms) in held?["gpu_passes"].as_object().into_iter().flatten() {
+        let pass: String = pass
+            .trim()
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | '0'..='9' => c,
+                'A'..='Z' => c.to_ascii_lowercase(),
+                _ => '_',
+            })
+            .collect();
+        if let Some(ms) = ms.as_f64() {
+            report.metric(&format!("gpu_pass.{scene}.{pass}_ms"), &[ms]);
+        }
+    }
+    Ok(true)
+}
+
 fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
     let scenes =
         scenes(&setup.scenario).ok_or_else(|| format!("unknown scenario {}", setup.scenario))?;
@@ -140,11 +173,28 @@ fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
         driver: text(&renderer["driver"]),
         backend: text(&renderer["backend"]).to_lowercase(),
         kind: text(&renderer["device_type"]),
+        vram_mb: None,
     });
+    if let Some(gpu) = report.hardware.gpu.as_mut() {
+        let vendor = horizon_telemetry::system::gpu_vendor(&gpu.name, 0);
+        let vendor = if gpu.vendor.is_empty() {
+            vendor
+        } else {
+            gpu.vendor.as_str()
+        }
+        .to_owned();
+        if gpu.kind.contains("iscrete") {
+            gpu.vram_mb = horizon_telemetry::system::vram_mb(&vendor);
+        }
+    }
+    report.hardware.storage =
+        horizon_telemetry::system::storage(&setup.game_dir).map(str::to_owned);
     report.hardware.display = serde_json::from_value(title["display"].clone()).ok();
 
     replace_world(&setup.game_dir)?;
     control.call(&format!("open {WORLD} {SEED} creative"))?;
+    // The world opens on a worker: its folder may not exist yet when `open` replies.
+    std::fs::create_dir_all(setup.game_dir.join("saves").join(WORLD)).map_err(|e| e.to_string())?;
     std::fs::write(
         setup.game_dir.join("saves").join(WORLD).join(MARKER),
         "Created by horizon-client --benchmark; replaced by the next run.\n",
@@ -187,7 +237,9 @@ fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
                 &[chunks / load.as_secs_f64()],
             );
         }
-        thread::sleep(SETTLE);
+        if !time_passes(control, name, &mut report)? {
+            thread::sleep(SETTLE);
+        }
         let [ex, ey, ez] = end;
         let begin = Instant::now();
         let flight = control.call(&format!(
@@ -222,6 +274,10 @@ fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
 
     let status = control.status();
     let renderer = &status["renderer"];
+    // On Wayland the window is on a screen only once it has been shown: ask again.
+    if report.hardware.display.is_none() {
+        report.hardware.display = serde_json::from_value(status["display"].clone()).ok();
+    }
     let c = &mut report.conditions;
     c.scenario = Some(setup.scenario.clone());
     c.seed = Some(SEED.to_string());
@@ -302,10 +358,15 @@ const QUIET_MESHES_PER_S: f64 = 100.0;
 /// happened (`tools/perf_bench.py`'s `wait_loaded`). With `status.streaming`, the sections are
 /// drawn once no stage has held work for half a second: blocks changing after the load (fluids
 /// settling, random ticks) only remesh in bursts. Without it, meshing has to go quiet.
+///
+/// Right after a teleport (and at spawn) the game reports nothing queued and steady counts for over
+/// a second before it starts loading: the counts must change once, or stay full for 5 s, and the
+/// resident chunks reach [`view_chunks`], before "steady" means loaded.
 fn wait_loaded(control: &Control, near: impl Fn(&Value) -> bool) -> Result<Instant, String> {
     let deadline = Instant::now() + LOAD_LIMIT;
     let (mut last, mut changed, mut meshing) = (None, Instant::now(), Instant::now());
     let mut previous: Option<(Instant, f64)> = None;
+    let (mut first, mut moved, began) = (None, false, Instant::now());
     while Instant::now() < deadline {
         let s = control.status();
         let now = Instant::now();
@@ -318,6 +379,19 @@ fn wait_loaded(control: &Control, near: impl Fn(&Value) -> bool) -> Result<Insta
             (last, changed, previous, meshing) = (None, now, None, now);
         } else {
             let counts = (s["chunks"].as_u64(), s["generated_chunks"].as_u64());
+            let resident = counts.0.unwrap_or(0);
+            let min_chunks = view_chunks(s["render_distance"].as_u64().unwrap_or(0));
+            let first = *first.get_or_insert(counts);
+            moved = moved
+                || counts != first
+                || (min_chunks > 0
+                    && resident >= min_chunks
+                    && now - began > Duration::from_secs(5));
+            if min_chunks > 0 && (!moved || resident < min_chunks) {
+                (last, changed, previous, meshing) = (None, now, None, now);
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             if last != Some(counts) {
                 (last, changed) = (Some(counts), now);
             }
@@ -347,6 +421,12 @@ fn wait_loaded(control: &Control, near: impl Fn(&Value) -> bool) -> Result<Insta
         thread::sleep(Duration::from_millis(50));
     }
     Err(format!("not loaded after {} s", LOAD_LIMIT.as_secs()))
+}
+
+/// 80% of the view circle (pi x RD^2): the game keeps 637 columns at RD 12 and 3725 at RD 32
+/// (`tools/perf_bench.py`'s `view_chunks`).
+fn view_chunks(distance: u64) -> u64 {
+    (0.8 * std::f64::consts::PI * (distance * distance) as f64) as u64
 }
 
 /// Vanilla's yaw facing from `start` to `end`.
@@ -397,6 +477,115 @@ mod tests {
         assert_eq!(scenes("standard").unwrap().len(), 4);
         assert_eq!(scenes("ocean").unwrap()[0].0, "ocean");
         assert!(scenes("nether").is_none());
+    }
+
+    #[test]
+    fn view_chunks_matches_perf_bench() {
+        assert_eq!(view_chunks(12), 361);
+        assert_eq!(view_chunks(32), 2573);
+        assert_eq!(view_chunks(0), 0);
+    }
+    /// The status a fake control answers with: the player is where it should
+    /// be, nothing is queued, and the world holds `chunks` resident chunks.
+    fn status(chunks: u64) -> String {
+        serde_json::json!({
+            "player": {"position": [0.0, 64.0, 0.0]},
+            "pending_chunks": 0,
+            "screen": "playing",
+            "render_distance": 12,
+            "chunks": chunks,
+            "generated_chunks": chunks,
+            "meshed_sections": 0,
+            "streaming": {},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn the_load_waits_for_the_chunks_a_teleport_starts() {
+        // Right after a teleport the game reports steady counts and nothing
+        // queued for over a second, before the integrated server has sent the
+        // first chunk: the quiet rule alone would call that loaded, and the
+        // scene would be measured over an empty view (#1749).
+        const LATE: usize = 30;
+        let (tx, rx) = mpsc::channel::<Request>();
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&polls);
+        let server = thread::spawn(move || {
+            let mut seen = 0;
+            while let Ok(request) = rx.recv() {
+                if request.line == "status" {
+                    let chunks = if seen < LATE { 0 } else { 400 };
+                    seen += 1;
+                    counted.store(seen, std::sync::atomic::Ordering::SeqCst);
+                    let _ = request.reply.send(status(chunks));
+                } else {
+                    let _ = request.reply.send("{}".to_owned());
+                }
+            }
+        });
+        let control = Control(tx);
+        wait_loaded(&control, |_| true).expect("the scene loads");
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > LATE,
+            "the load finished before the chunks arrived"
+        );
+        drop(control);
+        let _ = server.join();
+    }
+
+    /// The wait before a flight times the passes and turns the timing off again before the
+    /// flight; the report gets one metric per pass. Not on Metal.
+    #[test]
+    fn the_wait_times_the_passes_but_not_the_flight() {
+        let time_on = |backend: &str| {
+            let (tx, rx) = mpsc::channel::<Request>();
+            let server = thread::spawn(move || {
+                let mut lines = Vec::new();
+                while let Ok(request) = rx.recv() {
+                    let reply = if request.line.starts_with("bench ") {
+                        serde_json::json!({
+                            "frames": 120,
+                            "gpu_passes": {"World": 1.5, "World after culling": 0.25, "HUD": 0.01},
+                        })
+                    } else {
+                        serde_json::json!({ "ok": true })
+                    };
+                    let _ = request.reply.send(reply.to_string());
+                    lines.push(request.line);
+                }
+                lines
+            });
+            let hardware = horizon_bench::Hardware {
+                gpu: Some(horizon_bench::Gpu {
+                    backend: backend.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut report = Report::with_hardware(Kind::Game, App::default(), hardware);
+            let control = Control(tx);
+            let timed = time_passes(&control, "forest", &mut report).expect("the wait runs");
+            drop(control);
+            (timed, server.join().unwrap(), report.metrics)
+        };
+
+        let (timed, lines, metrics) = time_on("vulkan");
+        assert!(timed);
+        assert_eq!(lines, ["gpu-passes on", "bench 2", "gpu-passes off"]);
+        let mean = |name: &str| metrics.get(name).map(|s| s.mean);
+        assert_eq!(mean("gpu_pass.forest.world_ms"), Some(1.5));
+        assert_eq!(mean("gpu_pass.forest.world_after_culling_ms"), Some(0.25));
+        assert_eq!(mean("gpu_pass.forest.hud_ms"), Some(0.01));
+        assert_eq!(metrics.len(), 3);
+
+        let (timed, lines, metrics) = time_on("metal");
+        assert!(!timed);
+        assert!(
+            lines.is_empty(),
+            "Metal's overlapping passes are not timed: {lines:?}"
+        );
+        assert!(metrics.is_empty());
     }
 
     #[test]

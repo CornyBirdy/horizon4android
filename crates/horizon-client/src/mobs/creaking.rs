@@ -106,7 +106,7 @@ pub fn tear_down(m: &mut Mob, events: &mut Vec<MobEvent>) {
 /// invulnerability animation and the heart's reaction. Returns whether the
 /// normal damage path should run.
 pub fn accepts_damage(m: &mut Mob, source: &Damage) -> bool {
-    if !heart_bound(m) || source.kind == DamageKind::Generic {
+    if !heart_bound(m) || source.kind.bypasses_invulnerability() {
         return true;
     }
     if source.is_fire() || !m.alive() || m.extra.ints[INVULNERABLE] > 0 {
@@ -118,10 +118,13 @@ pub fn accepts_damage(m: &mut Mob, source: &Damage) -> bool {
         source.kind,
         DamageKind::PlayerAttack
             | DamageKind::MaceSmash
+            | DamageKind::Spear
             | DamageKind::MobAttack
             | DamageKind::Arrow
             | DamageKind::Thrown
             | DamageKind::Fireball
+            | DamageKind::WitherSkull
+            | DamageKind::WindCharge
             | DamageKind::Thorns
     );
     if !direct && !by_player {
@@ -152,8 +155,26 @@ pub fn sway(m: &mut Mob, events: &mut Vec<MobEvent>) {
 }
 /// `Creaking.doHurtTarget`: the attack animation (the sound is the
 /// `playAttackSound` that ends `Mob.doHurtTarget`).
-pub fn on_attack(m: &mut Mob, _events: &mut Vec<MobEvent>) {
+pub fn on_attack(m: &mut Mob, events: &mut Vec<MobEvent>) {
     m.extra.ints[ATTACKING] = ATTACK_TICKS;
+    broadcast(m, 4, events);
+}
+/// `Level.broadcastEntityEvent` for a creaking (guests run `entity_event`).
+fn broadcast(m: &Mob, event: i8, events: &mut Vec<MobEvent>) {
+    events.push(MobEvent::EntityEvent {
+        mob: m.id,
+        event,
+        at: [m.position.x, m.position.y, m.position.z],
+    });
+}
+/// `Creaking.handleEntityEvent` on a client: 66 the invulnerability flash,
+/// 4 the attack swing (the sounds are the server's).
+pub fn entity_event(m: &mut Mob, event: u8) {
+    match event {
+        66 => m.extra.ints[INVULNERABLE] = INVULNERABILITY_TICKS,
+        4 => m.extra.ints[ATTACKING] = ATTACK_TICKS,
+        _ => {}
+    }
 }
 /// The heart this creaking is bound to protects it (`isProtector`); a link
 /// read from a save is trusted until the heart resolves it.
@@ -176,15 +197,12 @@ pub fn update(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     if heart_bound(m) && m.alive() && !protected(m, w) {
         m.health = 0.0;
     }
-    for slot in [INVULNERABLE, ATTACKING] {
-        if m.extra.ints[slot] > 0 {
-            m.extra.ints[slot] -= 1;
-        }
+    // hurtServer set the invulnerability clock since the last tick: entity
+    // event 66.
+    if m.extra.ints[INVULNERABLE] == INVULNERABILITY_TICKS {
+        broadcast(m, 66, events);
     }
-    let age = m.age as f32;
-    m.anim.states[0].animate_when(m.extra.ints[ATTACKING] > 0, age);
-    m.anim.states[1].animate_when(m.extra.ints[INVULNERABLE] > 0, age);
-    m.anim.states[2].animate_when(tearing_down(m), age);
+    animate(m);
     if m.extra.counter & HURT != 0 {
         // hurtServer: sway, and the heart reacts to a player's hit.
         if protected(m, w) {
@@ -200,18 +218,6 @@ pub fn update(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
         }
         m.extra.counter &= !(HURT | HURT_BY_PLAYER);
     }
-    // checkEyeBlink: the eyes of a creaking falling apart flicker.
-    if m.death_time > m.extra.ints[NEXT_FLICKER] {
-        let glowing = m.extra.ints[EYES] != 0;
-        let (lo, hi) = if glowing {
-            (2, 8)
-        } else {
-            (m.death_time / 4, m.death_time / 2)
-        };
-        let span = (hi - lo + 1).max(1);
-        m.extra.ints[NEXT_FLICKER] = m.death_time + lo + m.random.next_int_bound(span).unwrap_or(0);
-        m.extra.ints[EYES] = i32::from(!glowing);
-    }
     if !m.alive() {
         return;
     }
@@ -224,6 +230,31 @@ pub fn update(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
             m.voice("entity.creaking.freeze", events);
         }
         m.extra.flag2 = !now;
+    }
+}
+/// The clocks and keyframe states `Creaking.aiStep`, `setupAnimationStates`
+/// and `checkEyeBlink` run (the server's and a client's).
+pub fn animate(m: &mut Mob) {
+    for slot in [INVULNERABLE, ATTACKING] {
+        if m.extra.ints[slot] > 0 {
+            m.extra.ints[slot] -= 1;
+        }
+    }
+    let age = m.age as f32;
+    m.anim.states[0].animate_when(m.extra.ints[ATTACKING] > 0, age);
+    m.anim.states[1].animate_when(m.extra.ints[INVULNERABLE] > 0, age);
+    m.anim.states[2].animate_when(tearing_down(m), age);
+    // checkEyeBlink: the eyes of a creaking falling apart flicker.
+    if m.death_time > m.extra.ints[NEXT_FLICKER] {
+        let glowing = m.extra.ints[EYES] != 0;
+        let (lo, hi) = if glowing {
+            (2, 8)
+        } else {
+            (m.death_time / 4, m.death_time / 2)
+        };
+        let span = (hi - lo + 1).max(1);
+        m.extra.ints[NEXT_FLICKER] = m.death_time + lo + m.random.next_int_bound(span).unwrap_or(0);
+        m.extra.ints[EYES] = i32::from(!glowing);
     }
 }
 /// `Mob.stopInPlace`.
@@ -361,4 +392,45 @@ pub fn anim(m: &Mob, s: &State, p: &mut Poses, animations: &HashMap<String, Anim
 /// The creaking species exists in the species table.
 pub fn is_creaking(m: &Mob) -> bool {
     m.species() == Species::Creaking
+}
+/// `Creaking.canUsePortal`: a creaking bound to a heart never travels through
+/// a portal, since its heart stays behind; one without a heart goes through
+/// like any other monster.
+pub fn can_use_portal(m: &Mob) -> bool {
+    !heart_bound(m)
+}
+#[cfg(test)]
+mod portal_tests {
+    use super::*;
+    use crate::mobs::sensor_scan_tests::kind;
+    use std::sync::Arc;
+
+    fn mob(species: Species) -> Mob {
+        let mut kind = (*kind()).clone();
+        kind.species = species;
+        Mob::new(1, Arc::new(kind), Vec3::ZERO, 0.0)
+    }
+
+    /// `Creaking.canUsePortal`: the creaking's own `!isHeartBound()`; a home
+    /// point another species keeps (a wolf's bed) is not a heart, so it does
+    /// not stop that mob from travelling.
+    #[test]
+    fn only_a_creaking_bound_to_a_heart_is_refused_the_portal() {
+        let mut m = mob(Species::Creaking);
+        assert!(!heart_bound(&m), "born free");
+        assert!(
+            crate::mobs::mob_can_use_portal(&m),
+            "a free creaking travels"
+        );
+        m.extra.home = Some([4, 64, -7]);
+        assert!(heart_bound(&m));
+        assert!(
+            !crate::mobs::mob_can_use_portal(&m),
+            "a creaking bound to its heart must not leave it behind"
+        );
+        let mut wolf = mob(Species::Wolf);
+        wolf.extra.home = Some([4, 64, -7]);
+        assert!(!heart_bound(&wolf));
+        assert!(crate::mobs::mob_can_use_portal(&wolf));
+    }
 }

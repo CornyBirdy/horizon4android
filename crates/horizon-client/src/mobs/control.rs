@@ -1,12 +1,12 @@
 //! Mob controls: `MoveControl` (with the flying and smooth-swimming
 //! variants), `LookControl`, `JumpControl` and `BodyRotationControl`.
-use super::{Mob, MobWorld, living::wrap};
+use super::{Mob, MobWorld, Species, living::wrap};
 use horizon_core::geometry::trig;
 
 /// `2.5000003E-7F` widened: the squared distance controls treat as arrived.
 const ARRIVED: f64 = 2.500_000_3e-7_f32 as f64;
 /// `1.0E-5F` widened.
-const EPSILON: f64 = 1.0e-5_f32 as f64;
+pub(super) const EPSILON: f64 = 1.0e-5_f32 as f64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Operation {
@@ -90,6 +90,9 @@ pub enum LookKind {
     Fixed,
     /// `HappyGhast.HappyGhastLookControl`.
     HappyGhast,
+    /// `Shulker.ShulkerLookControl`: the yaw turns in the attach face's
+    /// plane and the head is never clamped to the body.
+    Shulker,
 }
 #[derive(Clone, Debug, Default)]
 pub struct LookControl {
@@ -113,8 +116,16 @@ pub struct BodyRotation {
     last_stable_head: f32,
 }
 impl Mob {
+    /// `Mob.getMaxHeadXRot`, with `Wolf`'s 20 degrees while sitting.
+    pub fn max_head_x_rot(&self) -> f32 {
+        if self.species() == Species::Wolf && self.extra.sitting {
+            20.0
+        } else {
+            self.kind.max_head_x_rot
+        }
+    }
     pub fn look_at(&mut self, at: [f64; 3]) {
-        let (y, x) = (self.kind.head_rot_speed, self.kind.max_head_x_rot);
+        let (y, x) = (self.kind.head_rot_speed, self.max_head_x_rot());
         self.ai.look.set_look_at(at, y, x);
     }
     pub fn look_at_speed(&mut self, at: [f64; 3], y_speed: f32, x_max: f32) {
@@ -134,6 +145,19 @@ impl Mob {
     pub fn move_control_tick(&mut self, w: &MobWorld, events: &mut Vec<super::MobEvent>) {
         if self.species() == super::Species::Rabbit {
             return super::rabbit::move_control(self, w);
+        }
+        // Fox.FoxMoveControl.tick: still while asleep, sitting or faceplanted.
+        if self.species() == super::Species::Fox && !super::fox::can_move(self) {
+            return;
+        }
+        // Panda.PandaMoveControl: only while it can act.
+        if self.species() == super::Species::Panda
+            && !super::panda::can_perform_action(self, w.thundering)
+        {
+            return;
+        }
+        if self.species() == super::Species::Turtle {
+            return super::turtle::move_control(self);
         }
         let attr_speed = self.movement_speed();
         match self.ai.mov.kind {
@@ -314,6 +338,11 @@ impl Mob {
     /// LookControl.tick (and SmoothSwimmingLookControl).
     pub fn look_control_tick(&mut self) {
         let look = self.ai.look.clone();
+        let fox = self.species() == super::Species::Fox;
+        // Fox.FoxLookControl: no turning in sleep.
+        if fox && super::fox::flag(self, super::fox::SLEEPING) {
+            return;
+        }
         if look.kind == LookKind::HappyGhast {
             return super::happy_ghast::look_control(self);
         }
@@ -345,8 +374,23 @@ impl Mob {
                     self.body_yaw += 4.0;
                 }
             }
+            LookKind::Shulker => {
+                // ShulkerLookControl: resetXRotOnTick, getXRotD 0, and the
+                // yaw worked out in the attach face's plane (getYRotD).
+                self.head_pitch = 0.0;
+                if look.cooldown > 0 {
+                    self.ai.look.cooldown -= 1;
+                    if let Some(y) = super::shulker::look_yaw(self, look.wanted) {
+                        self.head_yaw = rotate_towards(self.head_yaw, y, look.y_max_rot_speed);
+                    }
+                } else {
+                    self.head_yaw = rotate_towards(self.head_yaw, self.body_yaw, 10.0);
+                }
+                // clampHeadRotationToBody does nothing for a shulker.
+            }
             LookKind::Default | LookKind::Fixed => {
-                if look.kind == LookKind::Default {
+                // FoxLookControl.resetXRotOnTick keeps a stalking or pouncing pitch.
+                if look.kind == LookKind::Default && (!fox || super::fox::resets_x_rot(self)) {
                     self.head_pitch = 0.0;
                 }
                 if look.cooldown > 0 {
@@ -365,6 +409,13 @@ impl Mob {
                         rotate_if_necessary(self.head_yaw, self.body_yaw, self.kind.max_head_y_rot);
                 }
             }
+        }
+        // Goat.setYHeadRot: the head is clamped to `getMaxHeadYRot` (15
+        // degrees) from the body on every set, so a standing goat cannot
+        // swivel it further than a walking one.
+        if self.species() == Species::Goat {
+            self.head_yaw =
+                rotate_if_necessary(self.head_yaw, self.body_yaw, self.kind.max_head_y_rot);
         }
     }
     fn look_angles(&self, at: [f64; 3]) -> (Option<f32>, Option<f32>) {
@@ -389,6 +440,13 @@ impl Mob {
     }
     /// BodyRotationControl.clientTick (Mob.tickHeadTurn).
     pub fn body_rotation_tick(&mut self) {
+        // Shulker.ShulkerBodyRotationControl.clientTick is empty: the body
+        // stays at 0 (recreateFromPacket), only the head turns.
+        if self.species() == super::Species::Shulker {
+            self.body_yaw = 0.0;
+            self.previous_body_yaw = 0.0;
+            return;
+        }
         let dx = self.position.x - self.previous.x;
         let dz = self.position.z - self.previous.z;
         let max = self.kind.max_head_y_rot;
@@ -415,4 +473,47 @@ impl Mob {
 /// Entity.rotlerp used by Mob.lookAt (clamped turn, no wrap of the result).
 fn rotate_toward_max(from: f32, to: f32, max: f32) -> f32 {
     from + wrap(to - from).clamp(-max, max)
+}
+
+#[cfg(test)]
+mod goat_head_tests {
+    use super::*;
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    fn mob(species: Species) -> Mob {
+        let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+        kind.species = species;
+        // Mob.getMaxHeadYRot: 15 for a goat (Goat.getMaxHeadYRot), 75 otherwise.
+        kind.max_head_y_rot = if species == Species::Goat { 15.0 } else { 75.0 };
+        Mob::new(1, Arc::new(kind), Vec3::ZERO, 0.0)
+    }
+
+    /// `Goat.setYHeadRot`: whatever the look control asks for, a goat's head
+    /// stays within `getMaxHeadYRot` (15 degrees) of its body, standing still
+    /// or walking; another mob turns as far as it likes.
+    #[test]
+    fn a_goats_head_stays_within_fifteen_degrees_of_its_body() {
+        let turned = |species: Species| {
+            let mut m = mob(species);
+            m.body_yaw = 0.0;
+            // A target 40 blocks to the side: a quarter turn away.
+            m.ai.look.kind = LookKind::Default;
+            m.ai.look.wanted = [40.0, 1.0, 0.0];
+            m.ai.look.y_max_rot_speed = 1000.0;
+            m.ai.look.x_max_rot_angle = 40.0;
+            m.ai.look.cooldown = 20;
+            m.look_control_tick();
+            wrap(m.head_yaw - m.body_yaw)
+        };
+        let goat = turned(Species::Goat);
+        assert!(
+            goat.abs() <= 15.0 + 1.0e-3,
+            "the goat's head turned {goat} degrees from its body"
+        );
+        assert!(
+            turned(Species::Cow).abs() > 15.0,
+            "a cow is not held to the goat's 15 degrees"
+        );
+    }
 }

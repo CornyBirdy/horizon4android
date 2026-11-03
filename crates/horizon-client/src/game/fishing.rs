@@ -1,7 +1,9 @@
 //! Fishing: `FishingRodItem.use` (cast / reel in), the `FishingHook` (flight,
 //! bobbing, lure and bite timers, open water, hooking mobs, retrieving the
 //! `gameplay/fishing` loot) and `FishingHookRenderer` (bobber and line).
-use super::{Game, view_vector};
+use super::{Game, lan::LanHost, lan_mobs::guest_bounds, view_vector};
+use horizon_client::advancements::EntityView;
+use horizon_client::lan::{entity::States, hub::Hub};
 use horizon_client::{
     blocks::Fluid,
     collisions::SceneCollisions,
@@ -12,10 +14,14 @@ use horizon_client::{
     pose::Pose,
 };
 use horizon_core::{
-    geometry::{Aabb, Vec3, trig},
+    geometry::{Aabb, Vec3, traverse_blocks, trig},
+    position::BlockPos,
     random::RandomSource,
 };
-use std::sync::Arc;
+use horizon_protocol::entity_data::{Value, serializer};
+use std::{collections::HashMap, sync::Arc};
+
+use super::lan_actions::GuestPlay;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
@@ -24,10 +30,13 @@ enum State {
     Hooked(u32),
 }
 pub(super) struct Hook {
-    position: Vec3,
-    previous: Vec3,
+    /// Its entity id, which a server's players track it under.
+    id: u32,
+    pub(super) position: Vec3,
+    pub(super) previous: Vec3,
     velocity: Vec3,
     state: State,
+    tick_count: i32,
     life: i32,
     on_ground: bool,
     nibble: i32,
@@ -38,6 +47,15 @@ pub(super) struct Hook {
     open_water: bool,
     luck: i32,
     lure: i32,
+    /// The position a server's update put it heading for.
+    lerp: HookLerp,
+}
+/// A player a hook can catch (`canHitEntity`): their entity id, which
+/// guest they are (none: the host) and their box.
+pub(super) struct HookTarget {
+    id: u32,
+    conn: Option<u32>,
+    bounds: Aabb,
 }
 const SIZE: f64 = 0.25;
 fn bounds(p: Vec3) -> Aabb {
@@ -47,9 +65,86 @@ fn bounds(p: Vec3) -> Aabb {
         Vec3::new(p.x + h, p.y + SIZE, p.z + h),
     )
 }
+fn segment_entry(start: Vec3, end: Vec3, bounds: Aabb) -> Option<f64> {
+    let min = bounds.min_position();
+    let max = bounds.max_position();
+    let start = [start.x, start.y, start.z];
+    let min = [min.x, min.y, min.z];
+    let max = [max.x, max.y, max.z];
+    if (0..3).all(|axis| start[axis] >= min[axis] && start[axis] < max[axis]) {
+        return None;
+    }
+    let delta = [end.x - start[0], end.y - start[1], end.z - start[2]];
+    let mut entry: f64 = 0.0;
+    let mut exit: f64 = 1.0;
+    for axis in 0..3 {
+        if delta[axis] == 0.0 {
+            if start[axis] < min[axis] || start[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let a = (min[axis] - start[axis]) / delta[axis];
+        let b = (max[axis] - start[axis]) / delta[axis];
+        entry = entry.max(a.min(b));
+        exit = exit.min(a.max(b));
+        if entry > exit {
+            return None;
+        }
+    }
+    (entry <= 1.0 && exit >= 0.0).then_some(entry)
+}
+/// `ProjectileUtil.computeMargin`: the fishing hook's target-box margin grows
+/// to 0.3 blocks over its first eight ticks.
+fn entity_hit_margin(tick_count: i32) -> f64 {
+    f64::from((tick_count - 2).clamp(0, 6)) / 20.0
+}
+fn first_entity_hit(
+    start: Vec3,
+    end: Vec3,
+    margin: f64,
+    targets: impl IntoIterator<Item = (u32, Aabb)>,
+) -> Option<u32> {
+    let mut hit = None;
+    let mut hit_at = f64::INFINITY;
+    for (id, target_bounds) in targets {
+        if let Some(at) = segment_entry(
+            start,
+            end,
+            target_bounds.inflate(Vec3::new(margin, margin, margin)),
+        ) && at < hit_at
+        {
+            hit = Some(id);
+            hit_at = at;
+        }
+    }
+    hit
+}
+fn pull_item(item: &mut horizon_client::entities::ItemEntity, delta: Vec3) {
+    item.velocity = item.velocity.add_vector(delta);
+    // The change is made outside ItemEntity::tick, so its velocity comparison
+    // cannot request the immediate motion update for tracking clients.
+    item.needs_sync = true;
+}
+impl Hook {
+    pub(super) fn bounds(&self) -> Aabb {
+        bounds(self.position)
+    }
+    /// `FishingHook.tick` returns before `applyEffectsFromBlocks` while it
+    /// holds an entity.
+    pub(super) fn applies_block_effects(&self) -> bool {
+        !matches!(self.state, State::Hooked(_))
+    }
+}
 /// RandomSource.triangle(mode, deviation).
 fn triangle(r: &mut impl RandomSource, mode: f64, deviation: f64) -> f64 {
     mode + deviation * (f64::from(r.next_float()) - f64::from(r.next_float()))
+}
+/// `FishingHook.onHitBlock`: `getDeltaMovement().normalize().scale(hit.distanceTo(this))`,
+/// where `HitResult.distanceTo` is the *squared* distance to the hook: the bobber
+/// springs back a little off a wall instead of stopping dead.
+fn rebound(velocity: Vec3, hit: Vec3, at: Vec3) -> Vec3 {
+    velocity.normalize().scale(hit.distance_squared(at))
 }
 impl Game<'_> {
     fn holds_rod(&self) -> bool {
@@ -65,13 +160,29 @@ impl Game<'_> {
         if &*stack.item != "minecraft:fishing_rod" {
             return false;
         }
+        // The mods hear a server player's cast or reel-in first.
+        if self.player.is_some()
+            && let (Some(uuid), Some(name)) = (self.lan_acting_uuid, self.lan_acting_name.clone())
+        {
+            let state = match &self.hook {
+                None => 0,
+                Some(h) if matches!(h.state, State::Hooked(_)) => 4,
+                Some(h) if h.nibble > 0 => 2,
+                Some(_) => 3,
+            };
+            let mut cancel = false;
+            self.native_player_fish(uuid, &name, state, &mut cancel);
+            if cancel {
+                return true;
+            }
+        }
         let Some(p) = self.player.as_ref() else {
             return false;
         };
         let at = [p.position.x, p.position.y, p.position.z];
         let pitch = 0.4 / (self.world.random.next_float() * 0.4 + 0.8);
         if self.hook.is_some() {
-            let damage = self.retrieve_hook();
+            let damage = self.retrieve_hook(stack);
             self.damage_held(damage);
             self.audio.play(
                 "minecraft:entity.fishing_bobber.retrieve",
@@ -90,21 +201,14 @@ impl Game<'_> {
             let lure = stack.enchantment_level("minecraft:lure") as i32 * 5 * 20;
             let luck = stack.enchantment_level("minecraft:luck_of_the_sea") as i32;
             let (yaw, pitch) = (self.yaw, self.pitch);
-            let y_cos = (-yaw.to_radians() - std::f32::consts::PI).cos();
-            let y_sin = (-yaw.to_radians() - std::f32::consts::PI).sin();
-            let x_cos = -(-pitch.to_radians()).cos();
-            let x_sin = (-pitch.to_radians()).sin();
+            let (y_sin, y_cos, dir_y) = cast_direction(yaw, pitch);
             let eye_y = p.position.y + f64::from(p.dimensions.eye_height);
             let start = Vec3::new(
                 p.position.x - f64::from(y_sin) * 0.3,
                 eye_y,
                 p.position.z - f64::from(y_cos) * 0.3,
             );
-            let mut v = Vec3::new(
-                f64::from(-y_sin),
-                f64::from((-(x_sin / x_cos)).clamp(-5.0, 5.0)),
-                f64::from(-y_cos),
-            );
+            let mut v = Vec3::new(f64::from(-y_sin), f64::from(dir_y), f64::from(-y_cos));
             let len = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
             let r = &mut self.world.random;
             v = Vec3::new(
@@ -114,11 +218,14 @@ impl Game<'_> {
             );
             // A spawned hook's start position is its feet: centre the box on the eye.
             let start = Vec3::new(start.x, start.y - SIZE / 2.0, start.z);
+            self.next_entity += 1;
             self.hook = Some(Hook {
+                id: self.next_entity,
                 position: start,
                 previous: start,
                 velocity: v,
                 state: State::Flying,
+                tick_count: 0,
                 life: 0,
                 on_ground: false,
                 nibble: 0,
@@ -129,13 +236,27 @@ impl Game<'_> {
                 open_water: true,
                 luck,
                 lure,
+                lerp: HookLerp::default(),
             });
         }
         self.swing_arm();
         true
     }
+    /// The boat the hook's owner rides (`Entity.isPassengerOfSameVehicle`).
+    fn own_vehicle(&self) -> Option<u32> {
+        match self.lan_acting {
+            None => self.riding,
+            Some(conn) => self.lan.as_ref().and_then(|h| {
+                h.hub
+                    .guests
+                    .iter()
+                    .find(|g| g.conn == conn)
+                    .and_then(|g| g.vehicle)
+            }),
+        }
+    }
     /// `FishingHook.retrieve`: the rod damage it costs.
-    fn retrieve_hook(&mut self) -> u32 {
+    fn retrieve_hook(&mut self, rod: &ItemStack) -> u32 {
         let Some(hook) = self.hook.take() else {
             return 0;
         };
@@ -146,37 +267,77 @@ impl Game<'_> {
         let mut damage = 0;
         if let State::Hooked(id) = hook.state {
             // pullEntity: 0.1 of the way to the owner.
+            let d = Vec3::new(
+                owner.x - hook.position.x,
+                owner.y - hook.position.y,
+                owner.z - hook.position.z,
+            );
+            let pulled = |v: Vec3| Vec3::new(v.x + d.x * 0.1, v.y + d.y * 0.1, v.z + d.z * 0.1);
+            let mut hooked_item = false;
             if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
-                let d = Vec3::new(
-                    owner.x - hook.position.x,
-                    owner.y - hook.position.y,
-                    owner.z - hook.position.z,
-                );
-                m.velocity = Vec3::new(
-                    m.velocity.x + d.x * 0.1,
-                    m.velocity.y + d.y * 0.1,
-                    m.velocity.z + d.z * 0.1,
-                );
+                m.velocity = pulled(m.velocity);
+            } else if let Some(item) = self.dropped.iter_mut().find(|i| i.id == id) {
+                pull_item(item, Vec3::new(d.x * 0.1, d.y * 0.1, d.z * 0.1));
+                hooked_item = true;
+            } else if let Some(t) = self.tnts.iter_mut().find(|t| t.id != 0 && t.id == id) {
+                t.velocity = pulled(t.velocity);
+            } else if let Some(a) = self.armor_stands.iter_mut().find(|a| a.id == id) {
+                a.velocity = pulled(a.velocity);
+            } else if let Some(b) = self.boats.iter_mut().find(|b| b.id == id) {
+                b.velocity = pulled(b.velocity);
+            } else if self.creatures.hook_targets.iter().any(|t| t.id == id) {
+                // A player: the hub moves them when the tick ends.
+                self.creatures
+                    .hook_pulls
+                    .push((id, Vec3::new(d.x * 0.1, d.y * 0.1, d.z * 0.1)));
             }
-            damage = 5;
+            // CriteriaTriggers.FISHING_ROD_HOOKED with no items.
+            let hooked = self
+                .mobs
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| self.mob_entity(m));
+            if let Some(hooked) = hooked {
+                self.trigger_fishing_rod_hooked(rod, &hooked, &[]);
+            }
+            // `hookedIn instanceof ItemEntity ? 3 : 5`.
+            damage = if hooked_item { 3 } else { 5 };
         } else if hook.nibble > 0 {
             let biome = self.biome_name_at(hook.position);
-            let Some(loot) = horizon_client::structure_blocks::loot_data(&self.options.resources)
-            else {
+            let Some(loot) = horizon_client::structure_blocks::loot_data(
+                &self.options.resources,
+                &self.pack_files(),
+            ) else {
                 return damage;
             };
+            // `withLuck(this.luck + owner.getLuck())`: the rod's Luck of the Sea
+            // plus the owner's luck attribute (the Luck and Bad Luck effects).
+            let owner_luck = self
+                .player
+                .as_mut()
+                .and_then(|p| p.attribute("minecraft:luck").ok())
+                .unwrap_or(0.0) as f32;
             let mut random = self.world.random.clone();
             let items = loot.roll(
                 "minecraft:gameplay/fishing",
                 &mut random,
-                hook.luck as f32,
+                hook.luck as f32 + owner_luck,
                 biome.as_deref(),
                 Some(hook.open_water),
             );
             self.world.random = random;
-            // FishingHook.retrieve: fish_caught for a catch.
-            self.stats.custom("fish_caught", 1);
+            let mut caught = Vec::new();
             for stack in items {
+                // FishingHook.retrieve: fish_caught for each catch in #minecraft:fishes.
+                if self
+                    .res
+                    .items()
+                    .item_tags
+                    .get("minecraft:fishes")
+                    .is_some_and(|t| t.contains(stack.item.as_str()))
+                {
+                    self.award_custom_stat("fish_caught", 1);
+                }
                 let mut item = ItemStack {
                     item: Arc::from(stack.item.as_str()),
                     count: stack.count.max(1) as u32,
@@ -197,6 +358,7 @@ impl Game<'_> {
                 if let Some(potion) = &stack.potion {
                     item = item.with_potion(potion);
                 }
+                caught.push(item.clone());
                 let (dx, dy, dz) = (
                     owner.x - hook.position.x,
                     owner.y - hook.position.y,
@@ -211,11 +373,20 @@ impl Game<'_> {
                     item,
                     [hook.position.x, hook.position.y, hook.position.z],
                     v,
-                    10,
+                    0,
                 );
                 let xp = self.world.random.next_int_bound(6).unwrap_or(0) as u32 + 1;
                 self.spawn_orbs([owner.x, owner.y + 0.5, owner.z + 0.5], xp);
             }
+            // CriteriaTriggers.FISHING_ROD_HOOKED: the hook itself is the entity.
+            let bobber = EntityView {
+                kind: "minecraft:fishing_bobber".into(),
+                position: [hook.position.x, hook.position.y, hook.position.z],
+                on_ground: hook.on_ground,
+                fishing_open_water: Some(hook.open_water),
+                ..Default::default()
+            };
+            self.trigger_fishing_rod_hooked(rod, &bobber, &caught);
             damage = 1;
         }
         if hook.on_ground {
@@ -223,11 +394,11 @@ impl Game<'_> {
         }
         damage
     }
-    fn biome_name_at(&self, p: Vec3) -> Option<String> {
+    pub(super) fn biome_name_at(&self, p: Vec3) -> Option<String> {
         let (x, y, z) = (p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
         let c = self.world.chunks.get(&(x >> 4, z >> 4))?;
         Some(
-            self.res.biomes().list[c.biome(x, y, z) as usize]
+            world_biomes!(self).list[c.biome(x, y, z) as usize]
                 .name
                 .clone(),
         )
@@ -293,9 +464,12 @@ impl Game<'_> {
         let mut speed = 1;
         let above = [b[0], b[1] + 1, b[2]];
         let sky = self.world.light(above[0], above[1], above[2]) >> 4 == 15;
-        let raining = self.world.weather.raining;
-        let r = &mut self.world.random;
-        if r.next_float() < 0.25 && raining && sky {
+        // Level.isRainingAt: rain (not snow) reaches the position.
+        if self.world.random.next_float() < 0.25
+            && self.with_level(|b, level, _| {
+                b.is_raining_at(level, BlockPos::new(above[0], above[1], above[2]))
+            })
+        {
             speed += 1;
         }
         let r = &mut self.world.random;
@@ -336,6 +510,19 @@ impl Game<'_> {
                     }
                 }
             } else {
+                // The mods hear a server player's fish bite, and may call it
+                // off: the wait starts over.
+                if let (Some(uuid), Some(name)) =
+                    (self.lan_acting_uuid, self.lan_acting_name.clone())
+                {
+                    let mut cancel = false;
+                    self.native_player_fish(uuid, &name, 1, &mut cancel);
+                    if cancel {
+                        h.time_until_lured = 0;
+                        h.time_until_hooked = 0;
+                        return;
+                    }
+                }
                 let pitch =
                     1.0 + (self.world.random.next_float() - self.world.random.next_float()) * 0.4;
                 self.audio.play(
@@ -408,6 +595,17 @@ impl Game<'_> {
         let options = ParticleOptions::simple(kind);
         self.particles
             .send_particles(&options, at, spread, speed, count);
+        // The players a server serves are sent them too.
+        self.lan_send_particles(super::lan_particles::QueuedParticle {
+            dimension: self.dim.id(),
+            options,
+            state: None,
+            at,
+            spread,
+            speed,
+            count: count as i32,
+            randomization: 0,
+        });
     }
     /// `FishingHook.tick`.
     pub(super) fn tick_fishing(&mut self) {
@@ -423,6 +621,16 @@ impl Game<'_> {
             + (h.position.z - owner.z).powi(2);
         if !self.holds_rod() || d2 > 1024.0 {
             return;
+        }
+        h.tick_count += 1;
+        // The players it can catch, as they stand now (the host's own hook;
+        // guests' hooks use the ones taken as their turns start).
+        if self.lan_acting.is_none()
+            && matches!(h.state, State::Flying | State::Hooked(_))
+            && let Some(host) = self.lan.take()
+        {
+            self.refresh_hook_targets(&host);
+            self.lan = Some(host);
         }
         h.previous = h.position;
         if h.on_ground {
@@ -449,35 +657,135 @@ impl Game<'_> {
                     self.hook = Some(h);
                     return;
                 }
-                // checkCollision: hook the first living mob it touches.
-                let bb = bounds(h.position);
-                let (lo, hi) = (bb.min_position(), bb.max_position());
-                if let Some(m) = self.mobs.iter().find(|m| {
-                    let mb = m.bounds();
-                    let (a, z) = (mb.min_position(), mb.max_position());
-                    m.alive()
-                        && a.x < hi.x
-                        && lo.x < z.x
-                        && a.y < hi.y
-                        && lo.y < z.y
-                        && a.z < hi.z
-                        && lo.z < z.z
-                }) {
-                    h.state = State::Hooked(m.id);
+                // checkCollision: find the first block and entity on the movement
+                // segment so a fast hook cannot tunnel or catch through a wall.
+                let to = h.position.add_vector(h.velocity);
+                let block_hit = {
+                    let mut scene = SceneCollisions {
+                        world: &self.world,
+                        binding: self.collision,
+                        subject: None,
+                    };
+                    traverse_blocks(h.position, to, 1024, |p: BlockPos| {
+                        let state = self.world.block(p.x, p.y, p.z);
+                        if self.res.facts().is_air(state) {
+                            return None;
+                        }
+                        let shape = self
+                            .collision
+                            .collision_shape(&mut scene, state, [p.x, p.y, p.z])
+                            .ok()?;
+                        shape.clip(h.position, to, p)
+                    })
+                    .ok()
+                    .flatten()
+                };
+                let entity_end = block_hit.map_or(to, |hit| hit.location);
+                let owner = self.lan_acting;
+                let own_vehicle = self.own_vehicle();
+                let hit = first_entity_hit(
+                    h.position,
+                    entity_end,
+                    entity_hit_margin(h.tick_count),
+                    self.mobs
+                        .iter()
+                        .filter(|m| m.alive())
+                        .map(|m| (m.id, m.bounds()))
+                        .chain(
+                            self.creatures
+                                .hook_targets
+                                .iter()
+                                .filter(|t| t.conn != owner)
+                                .map(|t| (t.id, t.bounds)),
+                        )
+                        .chain(
+                            self.armor_stands
+                                .iter()
+                                .filter(|a| a.health > 0.0 && !a.marker)
+                                .map(|a| (a.id, a.bounds())),
+                        )
+                        .chain(
+                            self.boats
+                                .iter()
+                                .filter(|b| Some(b.id) != own_vehicle)
+                                .map(|b| (b.id, b.bounds())),
+                        )
+                        .chain(self.dropped.iter().map(|i| (i.id, i.bounds())))
+                        .chain(
+                            self.tnts
+                                .iter()
+                                .filter(|t| t.id != 0)
+                                .map(|t| (t.id, t.bounds())),
+                        ),
+                );
+                if let Some(id) = hit {
+                    // Projectile.onHit on an entity: PROJECTILE_LAND.
+                    self.projectile_event(
+                        "minecraft:projectile_land",
+                        Some(horizon_client::mobs::Who::Player),
+                        [h.position.x, h.position.y, h.position.z],
+                    );
+                    h.state = State::Hooked(id);
                     h.velocity = Vec3::ZERO;
                     self.hook = Some(h);
                     return;
                 }
+                if let Some(hit) = block_hit {
+                    // Projectile.onHit on a block: PROJECTILE_LAND.
+                    self.projectile_event(
+                        "minecraft:projectile_land",
+                        Some(horizon_client::mobs::Who::Player),
+                        [hit.location.x, hit.location.y, hit.location.z],
+                    );
+                    h.velocity = rebound(h.velocity, hit.location, h.position);
+                }
             }
             State::Hooked(id) => {
-                match self.mobs.iter().find(|m| m.id == id && m.alive()) {
-                    Some(m) => {
-                        h.position = Vec3::new(
-                            m.position.x,
-                            m.position.y + f64::from(m.height()) * 0.8,
-                            m.position.z,
-                        )
-                    }
+                // updateHookedEntity: ride the hooked mob, player or item at 0.8 of its height.
+                let hooked = self
+                    .mobs
+                    .iter()
+                    .find(|m| m.id == id && m.alive())
+                    .map(|m| (m.position, f64::from(m.height())))
+                    .or_else(|| {
+                        self.creatures
+                            .hook_targets
+                            .iter()
+                            .find(|t| t.id == id)
+                            .map(|t| {
+                                let (lo, hi) = (t.bounds.min_position(), t.bounds.max_position());
+                                (
+                                    Vec3::new((lo.x + hi.x) / 2.0, lo.y, (lo.z + hi.z) / 2.0),
+                                    hi.y - lo.y,
+                                )
+                            })
+                    })
+                    .or_else(|| {
+                        self.armor_stands.iter().find(|a| a.id == id).map(|a| {
+                            let b = a.bounds();
+                            (a.position, b.max_position().y - b.min_position().y)
+                        })
+                    })
+                    .or_else(|| {
+                        self.boats
+                            .iter()
+                            .find(|b| b.id == id)
+                            .map(|b| (b.position, super::boats::HEIGHT))
+                    })
+                    .or_else(|| {
+                        self.dropped
+                            .iter()
+                            .find(|i| i.id == id)
+                            .map(|i| (i.position, horizon_client::entities::ItemEntity::WIDTH))
+                    })
+                    .or_else(|| {
+                        self.tnts
+                            .iter()
+                            .find(|t| t.id != 0 && t.id == id)
+                            .map(|t| (t.position, super::tnt::PrimedTnt::SIZE))
+                    });
+                match hooked {
+                    Some((at, height)) => h.position = Vec3::new(at.x, at.y + height * 0.8, at.z),
                     None => h.state = State::Flying,
                 }
                 self.hook = Some(h);
@@ -538,6 +846,46 @@ impl Game<'_> {
         );
         self.hook = Some(h);
     }
+    /// The players a hook can catch: everyone but spectators and the dead
+    /// (`Projectile.canHitEntity`), the host and the guests in the level.
+    pub(super) fn refresh_hook_targets(&mut self, host: &LanHost) {
+        let mut targets = Vec::new();
+        for g in &host.hub.guests {
+            if host.hub.here(g) && g.loaded && !g.dead && !g.spectator() {
+                targets.push(HookTarget {
+                    id: g.entity_id as u32,
+                    conn: Some(g.conn),
+                    bounds: guest_bounds(g),
+                });
+            }
+        }
+        self.creatures.hook_targets = targets;
+    }
+    /// `FishingHook.pullEntity` on the players the hooks reeled in this tick
+    /// pulled: their velocity moves, and a guest's reaches their client.
+    pub(super) fn flush_hook_pulls(&mut self) {
+        let pulls = std::mem::take(&mut self.creatures.hook_pulls);
+        let Some(mut host) = self.lan.take() else {
+            return;
+        };
+        for (id, delta) in pulls {
+            let push = |g: &mut Self| {
+                if let Some(p) = g.player.as_mut() {
+                    p.velocity = p.velocity.add_vector(delta);
+                }
+            };
+            if let Some(conn) = host
+                .hub
+                .guests
+                .iter()
+                .find(|g| g.entity_id as u32 == id)
+                .map(|g| g.conn)
+            {
+                self.guest_hit_by(&mut host, conn, push);
+            }
+        }
+        self.lan = Some(host);
+    }
     /// `FishingRodCast`: the stack in the arm holding the rod
     /// (`FishingHookRenderer.getHoldingArm`) while the hook is out.
     pub(super) fn cast_rod(&self) -> Option<&ItemStack> {
@@ -562,12 +910,17 @@ impl Game<'_> {
             lerp(h.previous.z, h.position.z),
         ))
     }
-    /// FishingHookRenderer: the bobber, a camera-facing half-block quad
-    /// centred on the hook.
+    /// FishingHookRenderer: the bobbers (this player's and the others' a
+    /// server tracks), camera-facing half-block quads centred on the hooks.
     pub(super) fn fishing_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
-        let Some(p) = self.hook_position(alpha) else {
+        let hooks: Vec<glam::DVec3> = self
+            .hook_position(alpha)
+            .into_iter()
+            .chain(self.remote_hook_ends(alpha).into_iter().map(|(h, _)| h))
+            .collect();
+        if hooks.is_empty() {
             return;
-        };
+        }
         let Some(r) = self
             .gui
             .atlas
@@ -577,56 +930,59 @@ impl Game<'_> {
         else {
             return;
         };
-        let light = self
-            .world
-            .light(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
-        let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
         let forward = glam::DVec3::from_array(view_vector(self.yaw, self.pitch));
         let right = forward.cross(glam::DVec3::Y).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
         let s = 0.25;
-        let corners = [
-            p - right * s - up * s,
-            p + right * s - up * s,
-            p + right * s + up * s,
-            p - right * s + up * s,
-        ];
         let uv = [[r.u0, r.v1], [r.u1, r.v1], [r.u1, r.v0], [r.u0, r.v0]];
-        for (v, uv) in corners.iter().zip(uv) {
-            out.push(Vertex {
-                normal: [0; 4],
-                pos: (*v - camera).as_vec3().to_array(),
-                uv,
-                layer: 0,
-                color: 0xFFFF_FFFF,
-                light: packed,
-            });
+        for p in hooks {
+            let light =
+                self.world
+                    .light(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+            let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
+            let corners = [
+                p - right * s - up * s,
+                p + right * s - up * s,
+                p + right * s + up * s,
+                p - right * s + up * s,
+            ];
+            for (v, uv) in corners.iter().zip(uv) {
+                out.push(Vertex {
+                    normal: [0; 4],
+                    pos: (*v - camera).as_vec3().to_array(),
+                    uv,
+                    layer: 0,
+                    color: 0xFFFF_FFFF,
+                    light: packed,
+
+                    glint_uv: [0.0, 0.0],
+                });
+            }
         }
     }
-    /// FishingHookRenderer: the line, 16 black `lines` segments sagging from
-    /// a quarter block above the hook to the rod in the player's hand,
+    /// FishingHookRenderer: each line, 16 black `lines` segments sagging
+    /// from a quarter block above the hook to the rod in its owner's hand,
     /// `width` pixels wide (`Window.getAppropriateLineWidth`).
     pub(super) fn fishing_line(&self, alpha: f64, size: [u32; 2]) -> Vec<Line> {
-        let (Some(hook), Some(hand)) = (
-            self.hook_position(alpha),
-            self.rod_hand_position(alpha, size),
-        ) else {
-            return Vec::new();
-        };
-        let offset = (hand - (hook + glam::DVec3::new(0.0, 0.25, 0.0))).as_vec3();
-        let point = |a: f32| {
-            let y = offset.y * (a * a + a) * 0.5 + 0.25;
-            hook + glam::Vec3::new(offset.x * a, y, offset.z * a).as_dvec3()
-        };
+        let own = self
+            .hook_position(alpha)
+            .zip(self.rod_hand_position(alpha, size));
         let width = horizon_client::gfx::outline_width(size[0]);
-        (0..16)
-            .map(|i| Line {
+        let mut lines = Vec::new();
+        for (hook, hand) in own.into_iter().chain(self.remote_hook_ends(alpha)) {
+            let offset = (hand - (hook + glam::DVec3::new(0.0, 0.25, 0.0))).as_vec3();
+            let point = |a: f32| {
+                let y = offset.y * (a * a + a) * 0.5 + 0.25;
+                hook + glam::Vec3::new(offset.x * a, y, offset.z * a).as_dvec3()
+            };
+            lines.extend((0..16).map(|i| Line {
                 start: point(i as f32 / 16.0).to_array(),
                 end: point((i + 1) as f32 / 16.0).to_array(),
                 color: 0xFF00_0000,
                 width,
-            })
-            .collect()
+            }));
+        }
+        lines
     }
     /// `FishingHookRenderer.getPlayerHandPos`: on the near plane in first
     /// person, beside the body otherwise.
@@ -694,6 +1050,20 @@ impl Game<'_> {
     }
 }
 impl Game<'_> {
+    /// The hooks drawn here, with their owners' ids (0 for this player's own).
+    pub(super) fn hooks_status(&self) -> Vec<serde_json::Value> {
+        let at = |p: Vec3| [p.x, p.y, p.z];
+        let own = self.hook.iter().map(|h| (h.id, 0, h.position));
+        let others = self
+            .remote_hooks
+            .iter()
+            .map(|h| (h.id, h.owner, h.position));
+        own.chain(others)
+            .map(|(id, owner, p)| {
+                serde_json::json!({"id": id, "kind": "minecraft:fishing_bobber", "owner": owner, "position": at(p)})
+            })
+            .collect()
+    }
     /// The hook for `horizon-ctl status`.
     pub(super) fn hook_status(&self) -> Option<serde_json::Value> {
         let h = self.hook.as_ref()?;
@@ -704,5 +1074,521 @@ impl Game<'_> {
             "hooked_in": h.time_until_hooked,
             "open_water": h.open_water,
         }))
+    }
+}
+
+/// A hook a server tracks to this client (`FishingHook.recreateFromPacket`)
+/// that another player cast: drawn where the server puts it, its line
+/// running to that player's hand.
+pub(super) struct RemoteHook {
+    id: u32,
+    owner: u32,
+    pub(super) position: Vec3,
+    pub(super) previous: Vec3,
+    velocity: Vec3,
+    state: State,
+    on_ground: bool,
+    lerp: HookLerp,
+}
+
+/// The `onGround` of a server's update (`handleMoveEntity`), except that a
+/// hook resting on the ground stays so while the update does not lift it: the
+/// server's tracker can send the flag a tick behind the landing.
+fn resting(was: bool, at: Vec3, target: [f64; 3], sent: bool) -> bool {
+    sent || (was && target[1] <= at.y + 1.0e-3)
+}
+
+/// `LinearInterpolationHandler`: where a server's update has a hook heading
+/// and the steps left (`DEFAULT_INTERPOLATION_STEPS` 3).
+#[derive(Default)]
+pub(super) struct HookLerp {
+    target: Vec3,
+    steps: u32,
+}
+impl HookLerp {
+    /// `interpolateTo`: a new target restarts the steps, the same one does not.
+    fn start(&mut self, target: [f64; 3]) {
+        let target = Vec3::new(target[0], target[1], target[2]);
+        if self.steps == 0 || self.target != target {
+            self.target = target;
+            self.steps = 3;
+        }
+    }
+    /// `doInterpolate`: a step of the way there.
+    fn step(&mut self, at: Vec3) -> Vec3 {
+        if self.steps == 0 {
+            return at;
+        }
+        let n = f64::from(self.steps);
+        self.steps -= 1;
+        Vec3::new(
+            at.x + (self.target.x - at.x) / n,
+            at.y + (self.target.y - at.y) / n,
+            at.z + (self.target.z - at.z) / n,
+        )
+    }
+    /// `applyPredictedMovement`: what the hook moved by itself carries the
+    /// target along while it is heading there.
+    fn moved(&mut self, by: Vec3) {
+        if self.steps > 0 {
+            self.target = Vec3::new(
+                self.target.x + by.x,
+                self.target.y + by.y,
+                self.target.z + by.z,
+            );
+        }
+    }
+}
+
+impl Hook {
+    pub(super) fn id(&self) -> u32 {
+        self.id
+    }
+    /// A server's update of this client's own hook (`handleMoveEntity` also
+    /// sets `onGround`).
+    pub(super) fn move_to(&mut self, target: [f64; 3], on_ground: bool) {
+        self.on_ground = resting(self.on_ground, self.position, target, on_ground);
+        self.lerp.start(target);
+    }
+}
+impl RemoteHook {
+    pub(super) fn id(&self) -> u32 {
+        self.id
+    }
+    /// A server's update of another player's hook.
+    pub(super) fn move_to(&mut self, target: [f64; 3], on_ground: bool) {
+        self.on_ground = resting(self.on_ground, self.position, target, on_ground);
+        self.lerp.start(target);
+    }
+}
+
+impl Hook {
+    /// This client's own hook as its server tracks it: drawn, never ticked here.
+    fn remote(id: u32, at: Vec3) -> Self {
+        Self {
+            id,
+            position: at,
+            previous: at,
+            velocity: Vec3::ZERO,
+            state: State::Flying,
+            tick_count: 0,
+            life: 0,
+            on_ground: false,
+            nibble: 0,
+            time_until_lured: 0,
+            time_until_hooked: 0,
+            fish_angle: 0.0,
+            out_of_water: 0,
+            open_water: true,
+            luck: 0,
+            lure: 0,
+            lerp: HookLerp::default(),
+        }
+    }
+    /// `FishingHook`'s entity for the players tracking it: the owner's id in
+    /// its add packet, DATA_HOOKED_ENTITY (the hooked id plus one) and
+    /// DATA_BITING when they differ from their defaults.
+    fn track(&self, owner: i32, out: &mut States) {
+        let p = self.position;
+        let e = out.add(
+            self.id as i32,
+            super::lan::entity_uuid(self.id),
+            "minecraft:fishing_bobber",
+        );
+        e.position = [p.x, p.y, p.z];
+        e.velocity = [self.velocity.x, self.velocity.y, self.velocity.z];
+        e.on_ground = self.on_ground;
+        e.data = owner;
+        if let State::Hooked(id) = self.state {
+            e.meta.push((8, serializer::INT, Value::Int(id as i32 + 1)));
+        }
+        if self.nibble > 0 {
+            e.meta.push((9, serializer::BOOLEAN, Value::Bool(true)));
+        }
+    }
+}
+
+impl Game<'_> {
+    /// The hooks guests track: each player's in the level.
+    pub(super) fn lan_hook_states(
+        &self,
+        play: &HashMap<u32, GuestPlay>,
+        hub: &Hub,
+        out: &mut States,
+    ) {
+        for g in hub.guests.iter().filter(|g| hub.here(g)) {
+            if let Some(h) = play.get(&g.conn).and_then(|p| p.hook.as_ref()) {
+                h.track(g.entity_id, out);
+            }
+        }
+    }
+
+    /// `handleAddEntity` for a fishing bobber: this player's own becomes its
+    /// hook (`Player.fishing`), another player's is drawn on its line to them.
+    pub(super) fn spawn_remote_hook(&mut self, id: u32, at: Vec3, velocity: Vec3, owner: i32) {
+        let own = self.remote.as_ref().map(|r| r.entity_id);
+        if own == Some(owner) {
+            let mut hook = Hook::remote(id, at);
+            hook.velocity = velocity;
+            self.hook = Some(hook);
+        } else {
+            self.remote_hooks.push(RemoteHook {
+                id,
+                owner: owner as u32,
+                position: at,
+                previous: at,
+                velocity,
+                state: State::Flying,
+                on_ground: false,
+                lerp: HookLerp::default(),
+            });
+        }
+    }
+
+    /// `FishingHook.onSyncedDataUpdated`: this player's hook is biting
+    /// (DATA_BITING), which `status` shows as a nibble.
+    pub(super) fn remote_hook_data(&mut self, id: u32, values: &[(u8, i32, Value)]) {
+        // DATA_HOOKED_ENTITY (the hooked id plus one, 0 for none): a hook on a
+        // client follows what it hooked (`FishingHook.onSyncedDataUpdated`).
+        let hooked = |value: &Value| match value {
+            Value::Int(v) if *v > 0 => State::Hooked(*v as u32 - 1),
+            _ => State::Flying,
+        };
+        if let Some(h) = self
+            .hook
+            .as_mut()
+            .filter(|h| h.id == id && self.remote.is_some())
+        {
+            for (index, _, value) in values {
+                match (index, value) {
+                    (9, Value::Bool(biting)) => h.nibble = i32::from(*biting),
+                    (8, value) => h.state = hooked(value),
+                    _ => {}
+                }
+            }
+        } else if let Some(h) = self.remote_hooks.iter_mut().find(|h| h.id == id) {
+            for (index, _, value) in values {
+                if *index == 8 {
+                    h.state = hooked(value);
+                }
+            }
+        }
+    }
+
+    /// `Entity.lerpMotion` for a hook a server tracks: the motion its own tick
+    /// moves it on with between the tracker's updates.
+    pub(super) fn remote_hook_motion(&mut self, id: u32, v: Vec3) -> bool {
+        if self.remote.is_none() {
+            return false;
+        }
+        if let Some(h) = self.hook.as_mut().filter(|h| h.id == id) {
+            h.velocity = v;
+        } else if let Some(h) = self.remote_hooks.iter_mut().find(|h| h.id == id) {
+            h.velocity = v;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// `FishingHook.tick` on a client: the interpolation step towards the
+    /// server's last update, then its own movement between the tracker's
+    /// updates (every five ticks), floating in water and riding what it
+    /// hooked, as the server's does.
+    pub(super) fn tick_remote_hooks(&mut self) {
+        if self.remote.is_none() {
+            return;
+        }
+        if let Some(mut h) = self.hook.take() {
+            h.previous = h.position;
+            h.position = h.lerp.step(h.position);
+            let before = h.position;
+            (h.position, h.velocity, h.state, h.on_ground) =
+                self.client_hook_step((h.position, h.velocity, h.state, h.on_ground));
+            h.lerp.moved(h.position.subtract(before));
+            self.hook = Some(h);
+        }
+        let mut hooks = std::mem::take(&mut self.remote_hooks);
+        for h in &mut hooks {
+            h.previous = h.position;
+            h.position = h.lerp.step(h.position);
+            let before = h.position;
+            (h.position, h.velocity, h.state, h.on_ground) =
+                self.client_hook_step((h.position, h.velocity, h.state, h.on_ground));
+            h.lerp.moved(h.position.subtract(before));
+        }
+        self.remote_hooks = hooks;
+    }
+
+    /// One tick of `FishingHook.tick`'s movement without the fishing (the
+    /// server's): position, motion, state and whether it rests on the ground.
+    fn client_hook_step(
+        &mut self,
+        (mut position, mut velocity, state, mut on_ground): (Vec3, Vec3, State, bool),
+    ) -> (Vec3, Vec3, State, bool) {
+        let b = [
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        ];
+        let liquid = self.water_height(b[0], b[1], b[2]).map_or(0.0, |w| w.0);
+        let in_water = liquid > 0.0;
+        match state {
+            State::Flying if in_water => {
+                velocity = Vec3::new(velocity.x * 0.3, velocity.y * 0.2, velocity.z * 0.3);
+                return (position, velocity, State::Bobbing, on_ground);
+            }
+            // A landed hook: the server stopped it dead (zero motion) and sends no
+            // more than the odd update; it does not fall on from here.
+            State::Flying if velocity == Vec3::ZERO && on_ground => {
+                return (position, velocity, state, on_ground);
+            }
+            State::Flying => {}
+            State::Hooked(id) => {
+                // updateHookedEntity: at 0.8 of the hooked entity's height.
+                let hooked = if self
+                    .remote
+                    .as_ref()
+                    .is_some_and(|r| r.entity_id as u32 == id)
+                {
+                    self.player
+                        .as_ref()
+                        .map(|p| (p.position, f64::from(p.dimensions.height)))
+                } else {
+                    self.mobs
+                        .iter()
+                        .find(|m| m.id == id && m.alive())
+                        .map(|m| (m.position, f64::from(m.height())))
+                        .or_else(|| {
+                            self.dropped
+                                .iter()
+                                .find(|i| i.id == id)
+                                .map(|i| (i.position, horizon_client::entities::ItemEntity::WIDTH))
+                        })
+                };
+                return match hooked {
+                    Some((at, height)) => (
+                        Vec3::new(at.x, at.y + height * 0.8, at.z),
+                        Vec3::ZERO,
+                        state,
+                        on_ground,
+                    ),
+                    None => (position, velocity, State::Flying, on_ground),
+                };
+            }
+            State::Bobbing => {
+                let mut force = position.y + velocity.y - f64::from(b[1]) - f64::from(liquid);
+                if force.abs() < 0.01 {
+                    force += force.signum() * 0.1;
+                }
+                let r = f64::from(self.world.random.next_float());
+                velocity = Vec3::new(
+                    velocity.x * 0.9,
+                    velocity.y - force * r * 0.2,
+                    velocity.z * 0.9,
+                );
+            }
+        }
+        if !in_water && !on_ground {
+            velocity.y -= 0.03;
+        }
+        let mut scene = SceneCollisions {
+            world: &self.world,
+            binding: self.collision,
+            subject: None,
+        };
+        if let Ok(moved) = scene.resolve(bounds(position), velocity, 0.0, on_ground) {
+            let horizontal =
+                (moved.x - velocity.x).abs() > 1.0e-7 || (moved.z - velocity.z).abs() > 1.0e-7;
+            on_ground = velocity.y < 0.0 && moved.y > velocity.y;
+            position = Vec3::new(
+                position.x + moved.x,
+                position.y + moved.y,
+                position.z + moved.z,
+            );
+            if state == State::Flying && (on_ground || horizontal) {
+                velocity = Vec3::ZERO;
+            }
+        }
+        velocity = Vec3::new(velocity.x * 0.92, velocity.y * 0.92, velocity.z * 0.92);
+        (position, velocity, state, on_ground)
+    }
+
+    pub(super) fn remove_remote_hook(&mut self, id: u32) {
+        if self.remote.is_some() && self.hook.as_ref().is_some_and(|h| h.id == id) {
+            self.hook = None;
+        }
+        self.remote_hooks.retain(|h| h.id != id);
+    }
+
+    pub(super) fn clear_remote_hooks(&mut self) {
+        if self.remote.is_some() {
+            self.hook = None;
+        }
+        self.remote_hooks.clear();
+    }
+
+    /// Other players' hooks: the bobber and its line to the owner's hand
+    /// (`FishingHookRenderer.getPlayerHandPos` in third person), as
+    /// (hook, hand) this frame.
+    fn remote_hook_ends(&self, alpha: f64) -> Vec<(glam::DVec3, glam::DVec3)> {
+        let lerp = |a: Vec3, b: Vec3| {
+            glam::DVec3::new(
+                a.x + (b.x - a.x) * alpha,
+                a.y + (b.y - a.y) * alpha,
+                a.z + (b.z - a.z) * alpha,
+            )
+        };
+        self.remote_hooks
+            .iter()
+            .filter_map(|h| {
+                let owner = self.mobs.iter().find(|m| m.id == h.owner)?;
+                let feet = lerp(owner.previous, owner.position);
+                let body = horizon_client::camera::lerp(
+                    alpha as f32,
+                    owner.previous_body_yaw,
+                    owner.body_yaw,
+                );
+                let angle = f64::from(body * (std::f64::consts::PI / 180.0) as f32);
+                let (sin, cos) = (f64::from(trig::sin(angle)), f64::from(trig::cos(angle)));
+                // The right arm; a crouching owner's eyes are lower.
+                let eye = owner.eye_y() - owner.position.y;
+                let hand = feet
+                    + glam::DVec3::new(
+                        -cos * 0.35 - sin * 0.8,
+                        eye - 0.45,
+                        -sin * 0.35 + cos * 0.8,
+                    );
+                Some((lerp(h.previous, h.position), hand))
+            })
+            .collect()
+    }
+}
+
+/// `FishingHook(Player, Level, int, int)`: `(ySin, yCos, y)` of the cast direction, using
+/// `Mth.sin`/`Mth.cos` (the 65536-entry table), so straight down gives `xCos == -0.0`, y `-5`.
+fn cast_direction(yaw: f32, pitch: f32) -> (f32, f32, f32) {
+    let ya = f64::from(-yaw * trig::DEG_TO_RAD - std::f32::consts::PI);
+    let pa = f64::from(-pitch * trig::DEG_TO_RAD);
+    let (y_sin, y_cos) = (trig::sin(ya), trig::cos(ya));
+    let (x_cos, x_sin) = (-trig::cos(pa), trig::sin(pa));
+    (y_sin, y_cos, (-(x_sin / x_cos)).clamp(-5.0, 5.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cast_direction, entity_hit_margin, first_entity_hit, pull_item, rebound};
+    use horizon_client::{entities::ItemEntity, items::ItemStack};
+    use horizon_core::geometry::{Aabb, Vec3};
+
+    #[test]
+    fn casting_straight_down_aims_down_and_straight_up_aims_up() {
+        assert_eq!(cast_direction(0.0, 90.0).2, -5.0);
+        assert_eq!(cast_direction(123.0, 89.9).2, -5.0);
+        assert_eq!(cast_direction(0.0, -90.0).2, 5.0);
+        assert_eq!(cast_direction(0.0, 0.0).2, 0.0);
+    }
+
+    #[test]
+    fn cast_direction_uses_the_vanilla_sine_table() {
+        // pitch 45: y = -(sin(-a) / -cos(-a)) with table entries built independently.
+        let a = f64::from(-45.0_f32 * std::f32::consts::PI / 180.0);
+        let table = |i: i64| ((i & 65535) as f64 / 10430.378350470453).sin() as f32;
+        let (s, c) = (
+            table((a * 10430.378350470453) as i64),
+            -table((a * 10430.378350470453 + 16384.0) as i64),
+        );
+        let (_, _, y) = cast_direction(0.0, 45.0);
+        assert!((y - (-(s / c))).abs() < 1e-3, "{y}");
+    }
+
+    /// `HitResult.distanceTo` is squared: a hit 0.5 away rebounds at 0.25.
+    #[test]
+    fn a_block_hit_rebounds_by_the_squared_distance() {
+        let v = Vec3::new(0.0, 0.0, -2.0);
+        let hit = Vec3::new(0.0, 0.0, -0.5);
+        assert_eq!(rebound(v, hit, Vec3::ZERO), Vec3::new(0.0, 0.0, -0.25));
+    }
+
+    #[test]
+    fn reeling_an_item_requests_an_immediate_motion_update() {
+        let mut item = ItemEntity {
+            no_gravity: false,
+            health: 5,
+            fire_ticks: 0,
+            id: 1,
+            stack: ItemStack::new("minecraft:stone", 1),
+            thrower: None,
+            target: None,
+            position: Vec3::ZERO,
+            previous: Vec3::ZERO,
+            velocity: Vec3::new(0.2, 0.0, -0.1),
+            on_ground: true,
+            vertical_collision: false,
+            horizontal_collision: false,
+            age: 0,
+            pickup_delay: 0,
+            bob_offset: 0.0,
+            ticks: 0,
+            needs_sync: false,
+            stuck: Vec3::ZERO,
+        };
+
+        pull_item(&mut item, Vec3::new(0.5, 0.1, -0.2));
+
+        assert!((item.velocity.x - 0.7).abs() < 1.0e-12);
+        assert!((item.velocity.y - 0.1).abs() < 1.0e-12);
+        assert!((item.velocity.z + 0.3).abs() < 1.0e-12);
+        assert!(item.needs_sync);
+    }
+
+    #[test]
+    fn a_flying_hook_hits_a_small_target_between_ticks() {
+        let target = Aabb::new(Vec3::new(0.45, -0.1, -0.1), Vec3::new(0.7, 0.15, 0.1));
+
+        assert!(super::segment_entry(Vec3::ZERO, Vec3::new(0.8, 0.0, 0.0), target).is_some());
+        assert!(super::segment_entry(Vec3::ZERO, Vec3::new(0.4, 0.0, 0.0), target).is_none());
+    }
+
+    #[test]
+    fn a_flying_hook_uses_vanillas_growing_entity_hit_margin() {
+        let start = Vec3::ZERO;
+        let end = Vec3::new(1.0, 0.0, 0.0);
+        let target = Aabb::new(Vec3::new(0.5, 0.31, -0.1), Vec3::new(0.7, 0.5, 0.1));
+
+        assert_eq!(entity_hit_margin(2), 0.0);
+        assert_eq!(entity_hit_margin(8), 0.3);
+        assert_eq!(
+            first_entity_hit(start, end, entity_hit_margin(8), [(1, target)]),
+            None
+        );
+        let within_margin = Aabb::new(Vec3::new(0.5, 0.29, -0.1), Vec3::new(0.7, 0.5, 0.1));
+        assert_eq!(
+            first_entity_hit(start, end, entity_hit_margin(8), [(1, within_margin)]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_flying_hook_does_not_hit_a_target_it_starts_inside() {
+        let target = Aabb::new(Vec3::new(-0.1, -0.1, -0.1), Vec3::new(0.7, 0.15, 0.1));
+
+        assert_eq!(
+            first_entity_hit(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 0.0, [(1, target)]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_flying_hook_uses_the_first_target_along_its_path() {
+        let start = Vec3::ZERO;
+        let end = Vec3::new(1.0, 0.0, 0.0);
+        let near = Aabb::new(Vec3::new(0.45, -0.1, -0.1), Vec3::new(0.7, 0.15, 0.1));
+        let far = Aabb::new(Vec3::new(0.8, -0.1, -0.1), Vec3::new(0.95, 0.15, 0.1));
+
+        assert_eq!(
+            first_entity_hit(start, end, 0.0, [(2, far), (1, near)]),
+            Some(1)
+        );
     }
 }
