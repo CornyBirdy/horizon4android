@@ -20891,7 +20891,7 @@ impl Loading {
                     static FAILED: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
                     let n = FAILED.fetch_add(1, Ordering::Relaxed);
-                    if n < 5 || n % 1000 == 0 {
+                    if n < 5 || n.is_multiple_of(1000) {
                         log::warn!("Horizon: loading screen frame failed ({n} so far): {e}");
                     }
                 }
